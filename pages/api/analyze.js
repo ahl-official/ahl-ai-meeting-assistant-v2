@@ -82,7 +82,7 @@ Rules:
         'X-Title': 'AI Meeting Assistant',
       },
       body: JSON.stringify({
-        model: 'openrouter/free',
+        model: 'openai/gpt-4o-mini',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.2,
         max_tokens: 1500,
