@@ -13,6 +13,7 @@ export default function NewMeeting() {
   const [inputMode, setInputMode] = useState('voice');
   const [title, setTitle] = useState('');
   const [transcript, setTranscript] = useState('');
+  const [srt, setSrt] = useState('');                  // ← FIX 3: store SRT
   const [duration, setDuration] = useState(0);
   const [analyzing, setAnalyzing] = useState(false);
   const [aiResult, setAiResult] = useState(null);
@@ -58,6 +59,7 @@ export default function NewMeeting() {
         id: Date.now().toString(),
         title,
         transcript,
+        srt,                                           // ← persist SRT if needed
         summary: aiResult?.summary || '',
         actionPoints: aiResult?.actionPoints || [],
         decisions: aiResult?.decisions || [],
@@ -76,11 +78,13 @@ export default function NewMeeting() {
     }
   };
 
+  // ── FIX 1: read transcribe response directly — no polling ──
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setError('');
     setTranscript('');
+    setSrt('');
     setUploadState('transcribing');
 
     try {
@@ -89,32 +93,28 @@ export default function NewMeeting() {
         headers: { 'Content-Type': 'application/octet-stream' },
         body: file,
       });
-      const submitData = await res.json();
-      if (submitData.error) throw new Error(submitData.error);
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || `Server error ${res.status}`);
+      if (!data.transcript) throw new Error('Empty transcription returned');
 
-      const poll = async () => {
-        try {
-          const statusRes = await fetch(`/api/transcript-status?id=${submitData.id}`);
-          const data = await statusRes.json();
-          if (data.status === 'completed') {
-            setTranscript(data.transcript);
-            setUploadState('done');
-          } else if (data.status === 'error') {
-            throw new Error(data.error || 'Transcription failed');
-          } else {
-            setTimeout(poll, 3000);
-          }
-        } catch (err) {
-          setError('Transcription failed: ' + err.message);
-          setUploadState('idle');
-        }
-      };
-
-      poll();
+      setTranscript(data.transcript);
+      if (data.srt) setSrt(data.srt);                // ← FIX 3: store SRT from upload
+      setUploadState('done');
     } catch (err) {
       setError('Upload transcription failed: ' + err.message);
       setUploadState('idle');
     }
+  };
+
+  // ── SRT download helper ────────────────────────────────────
+  const downloadSRT = () => {
+    const blob = new Blob([srt], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (title || 'transcript') + '.srt';
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   if (loading || !user) return null;
@@ -163,10 +163,15 @@ export default function NewMeeting() {
                 </button>
               </div>
 
+              {/* ── FIX 3: pass srt through onComplete ── */}
               {inputMode === 'voice' && (
                 <LiveRecorder
                   onTranscriptUpdate={setTranscript}
-                  onComplete={(t, d) => { setTranscript(t); setDuration(d); }}
+                  onComplete={(t, d, s) => {
+                    setTranscript(t);
+                    setDuration(d);
+                    if (s) setSrt(s);                // ← capture SRT from live recording
+                  }}
                 />
               )}
 
@@ -196,17 +201,30 @@ export default function NewMeeting() {
                     style={{ padding: '10px' }}
                     onChange={handleFileUpload}
                   />
+
                   {uploadState === 'transcribing' && (
                     <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8, color: 'var(--gray-500)' }}>
                       <span className="spinner" />
                       <span>Transcribing your file… please wait</span>
                     </div>
                   )}
+
+                  {/* ── FIX 1 + 3: done state with SRT download button ── */}
                   {uploadState === 'done' && (
-                    <div style={{ marginTop: 12 }}>
+                    <div style={{ marginTop: 12, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                       <span className="badge badge-green">✓ Transcription complete — scroll down to analyze</span>
+                      {srt && (
+                        <button
+                          className="btn btn-ghost"
+                          style={{ fontSize: 13, padding: '4px 12px' }}
+                          onClick={downloadSRT}
+                        >
+                          ↓ Download .srt
+                        </button>
+                      )}
                     </div>
                   )}
+
                   {uploadState === 'done' && transcript && (
                     <div className={styles.fieldGroup} style={{ marginTop: 16 }}>
                       <label className={styles.label}>Transcript Preview</label>
