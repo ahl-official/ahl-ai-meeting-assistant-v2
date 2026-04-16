@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import styles from '../styles/LiveRecorder.module.css';
+import { decodeAudioFile, splitAudioBufferIntoWavChunks, sleep, buildSrtFromResults } from '../lib/audio-processor';
 
 function getSupportedMimeType() {
   const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg'];
@@ -12,9 +13,10 @@ function getSupportedMimeType() {
 export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
   const [state, setState] = useState('idle');
   const [transcript, setTranscript] = useState('');
-  const [srt, setSrt] = useState('');                  // ← FIX: store SRT
+  const [srt, setSrt] = useState('');
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState('');
+  const [uploadProgress, setUploadProgress] = useState(0);
 
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
@@ -57,35 +59,64 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
 
     recorder.onstop = async () => {
       setState('transcribing');
+      setUploadProgress(0);
       const mime = getSupportedMimeType() || 'audio/webm';
       const blob = new Blob(chunksRef.current, { type: mime });
 
       try {
-        const res = await fetch('/api/transcribe', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: blob,
-        });
+        // Use robust chunking logic for live recordings too
+        const audioBuffer = await decodeAudioFile(blob);
+        const chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 60);
+        const totalChunks = chunks.length;
+        const results = [];
 
-        const data = await res.json();
+        for (let i = 0; i < chunks.length; i++) {
+          setUploadProgress(Math.round(((i) / totalChunks) * 100));
 
-        if (!res.ok || data.error) {
-          throw new Error(data.error || `Server error ${res.status}`);
+          const uploadRes = await fetch('/api/transcribe-chunk', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: chunks[i].blob,
+          });
+
+          const uploadData = await uploadRes.json();
+          if (!uploadRes.ok || uploadData.error) throw new Error(uploadData.error || `Upload error ${uploadRes.status}`);
+
+          const transcriptId = uploadData.id;
+
+          let completed = false;
+          let chunkResult = null;
+          while (!completed) {
+            await sleep(3000);
+            const statusRes = await fetch(`/api/transcript-status?id=${transcriptId}`);
+            chunkResult = await statusRes.json();
+
+            if (chunkResult.status === 'completed') {
+              completed = true;
+            } else if (chunkResult.status === 'error') {
+              throw new Error(chunkResult.error || 'Transcription error');
+            }
+          }
+
+          chunkResult.offsetMs = chunks[i].startMs;
+          results.push(chunkResult);
+
+          setUploadProgress(Math.round(((i + 1) / totalChunks) * 100));
         }
 
-        if (data.status !== 'completed' || !data.transcript) {
-          throw new Error('Transcription returned empty result');
-        }
+        const combinedTranscript = results.map(r => r.transcript).join(' ').trim();
+        const combinedSrt = buildSrtFromResults(results);
 
-        setTranscript(data.transcript);
-        if (data.srt) setSrt(data.srt);              // ← FIX: store SRT locally
+        setTranscript(combinedTranscript);
+        setSrt(combinedSrt);
 
-        onTranscriptUpdate?.(data.transcript);
-        onComplete?.(data.transcript, durationRef.current, data.srt);  // ← FIX: pass srt as 3rd arg
+        onTranscriptUpdate?.(combinedTranscript);
+        onComplete?.(combinedTranscript, durationRef.current, combinedSrt);
 
         setState('stopped');
 
       } catch (err) {
+        console.error(err);
         setError(`Transcription failed: ${err.message}`);
         setState('idle');
       }
@@ -106,7 +137,6 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
     mediaRecorderRef.current?.stop();
   };
 
-  // ── SRT download helper ────────────────────────────────────
   const downloadSRT = () => {
     const blob = new Blob([srt], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
@@ -153,9 +183,14 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
         )}
 
         {state === 'transcribing' && (
-          <div className={styles.recording}>
-            <span className="spinner" style={{ marginRight: 8 }} />
-            <span>Transcribing… please wait</span>
+          <div className={styles.recording} style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+              <span className="spinner" style={{ marginRight: 8 }} />
+              <span>Transcribing ({uploadProgress}%)... please wait</span>
+            </div>
+            <div style={{ width: '100%', height: 4, background: 'var(--gray-200)', borderRadius: 10, overflow: 'hidden' }}>
+              <div style={{ width: `${uploadProgress}%`, height: '100%', background: 'var(--blue)', transition: 'width 0.3s ease' }} />
+            </div>
           </div>
         )}
 

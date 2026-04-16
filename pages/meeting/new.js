@@ -5,6 +5,7 @@ import LiveRecorder from '../../components/LiveRecorder';
 import { useAuth } from '../../lib/auth';
 import { saveMeeting } from '../../lib/api';
 import styles from '../../styles/NewMeeting.module.css';
+import { decodeAudioFile, splitAudioBufferIntoWavChunks, sleep, buildSrtFromResults } from '../../lib/audio-processor';
 
 export default function NewMeeting() {
   const { user, loading } = useAuth();
@@ -13,13 +14,14 @@ export default function NewMeeting() {
   const [inputMode, setInputMode] = useState('voice');
   const [title, setTitle] = useState('');
   const [transcript, setTranscript] = useState('');
-  const [srt, setSrt] = useState('');                  // ← FIX 3: store SRT
+  const [srt, setSrt] = useState('');
   const [duration, setDuration] = useState(0);
   const [analyzing, setAnalyzing] = useState(false);
   const [aiResult, setAiResult] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [uploadState, setUploadState] = useState('idle');
+  const [uploadProgress, setUploadProgress] = useState(0);
 
   useEffect(() => {
     if (!loading && !user) router.push('/');
@@ -59,7 +61,7 @@ export default function NewMeeting() {
         id: Date.now().toString(),
         title,
         transcript,
-        srt,                                           // ← persist SRT if needed
+        srt,
         summary: aiResult?.summary || '',
         actionPoints: aiResult?.actionPoints || [],
         decisions: aiResult?.decisions || [],
@@ -78,35 +80,76 @@ export default function NewMeeting() {
     }
   };
 
-  // ── FIX 1: read transcribe response directly — no polling ──
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
     setError('');
     setTranscript('');
     setSrt('');
-    setUploadState('transcribing');
+    setUploadState('uploading');
+    setUploadProgress(0);
 
     try {
-      const res = await fetch('/api/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: file,
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error || `Server error ${res.status}`);
-      if (!data.transcript) throw new Error('Empty transcription returned');
+      // 1. Decode and chunk the audio
+      const audioBuffer = await decodeAudioFile(file);
+      setDuration(audioBuffer.duration);
 
-      setTranscript(data.transcript);
-      if (data.srt) setSrt(data.srt);                // ← FIX 3: store SRT from upload
+      const chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 60); // 60s chunks
+      const totalChunks = chunks.length;
+      const results = [];
+
+      for (let i = 0; i < chunks.length; i++) {
+        setUploadProgress(Math.round(((i) / totalChunks) * 100));
+
+        // 2. Upload chunk and start job
+        const uploadRes = await fetch('/api/transcribe-chunk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: chunks[i].blob,
+        });
+
+        const uploadData = await uploadRes.json();
+        if (!uploadRes.ok || uploadData.error) throw new Error(uploadData.error || `Upload error ${uploadRes.status}`);
+
+        const transcriptId = uploadData.id;
+
+        // 3. Poll for status
+        let completed = false;
+        let chunkResult = null;
+        while (!completed) {
+          await sleep(3000);
+          const statusRes = await fetch(`/api/transcript-status?id=${transcriptId}`);
+          chunkResult = await statusRes.json();
+
+          if (chunkResult.status === 'completed') {
+            completed = true;
+          } else if (chunkResult.status === 'error') {
+            throw new Error(chunkResult.error || 'Transcription error');
+          }
+        }
+
+        // 4. Attach the correct offset to the result
+        chunkResult.offsetMs = chunks[i].startMs;
+        results.push(chunkResult);
+
+        setUploadProgress(Math.round(((i + 1) / totalChunks) * 100));
+      }
+
+      // 5. Combine results
+      const combinedTranscript = results.map(r => r.transcript).join(' ').trim();
+      const combinedSrt = buildSrtFromResults(results);
+
+      setTranscript(combinedTranscript);
+      setSrt(combinedSrt);
       setUploadState('done');
     } catch (err) {
+      console.error(err);
       setError('Upload transcription failed: ' + err.message);
       setUploadState('idle');
     }
   };
 
-  // ── SRT download helper ────────────────────────────────────
   const downloadSRT = () => {
     const blob = new Blob([srt], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
@@ -129,7 +172,6 @@ export default function NewMeeting() {
         </div>
 
         <div className={styles.layout}>
-          {/* Left: Input */}
           <div className={styles.inputSection}>
             <div className={'card ' + styles.card}>
               <div className={styles.fieldGroup}>
@@ -163,14 +205,13 @@ export default function NewMeeting() {
                 </button>
               </div>
 
-              {/* ── FIX 3: pass srt through onComplete ── */}
               {inputMode === 'voice' && (
                 <LiveRecorder
                   onTranscriptUpdate={setTranscript}
                   onComplete={(t, d, s) => {
                     setTranscript(t);
                     setDuration(d);
-                    if (s) setSrt(s);                // ← capture SRT from live recording
+                    if (s) setSrt(s);
                   }}
                 />
               )}
@@ -200,16 +241,21 @@ export default function NewMeeting() {
                     className="input"
                     style={{ padding: '10px' }}
                     onChange={handleFileUpload}
+                    disabled={uploadState === 'uploading'}
                   />
 
-                  {uploadState === 'transcribing' && (
-                    <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8, color: 'var(--gray-500)' }}>
-                      <span className="spinner" />
-                      <span>Transcribing your file… please wait</span>
+                  {uploadState === 'uploading' && (
+                    <div style={{ marginTop: 12 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--gray-500)', marginBottom: 4 }}>
+                        <span className="spinner" />
+                        <span>Transcribing your file ({uploadProgress}%)...</span>
+                      </div>
+                      <div style={{ width: '100%', height: 6, background: 'var(--gray-200)', borderRadius: 10, overflow: 'hidden' }}>
+                        <div style={{ width: `${uploadProgress}%`, height: '100%', background: 'var(--blue)', transition: 'width 0.3s ease' }} />
+                      </div>
                     </div>
                   )}
 
-                  {/* ── FIX 1 + 3: done state with SRT download button ── */}
                   {uploadState === 'done' && (
                     <div style={{ marginTop: 12, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                       <span className="badge badge-green">✓ Transcription complete — scroll down to analyze</span>
@@ -252,7 +298,7 @@ export default function NewMeeting() {
                 <button
                   className="btn btn-primary"
                   onClick={analyzeTranscript}
-                  disabled={analyzing || !transcript.trim()}
+                  disabled={analyzing || !transcript.trim() || uploadState === 'uploading'}
                 >
                   {analyzing ? <><span className="spinner" /> Analyzing…</> : '✦ Analyze with AI'}
                 </button>
@@ -260,7 +306,6 @@ export default function NewMeeting() {
             </div>
           </div>
 
-          {/* Right: AI Results */}
           <div className={styles.resultsSection}>
             {!aiResult && !analyzing && (
               <div className={styles.placeholder}>
