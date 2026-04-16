@@ -95,7 +95,7 @@ export default function NewMeeting() {
       const audioBuffer = await decodeAudioFile(file);
       setDuration(audioBuffer.duration);
 
-      const chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 60); // 60s chunks
+      const chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 30); // 30s chunks
       const totalChunks = chunks.length;
       const results = [];
 
@@ -109,9 +109,12 @@ export default function NewMeeting() {
           body: chunks[i].blob,
         });
 
-        const uploadData = await uploadRes.json();
-        if (!uploadRes.ok || uploadData.error) throw new Error(uploadData.error || `Upload error ${uploadRes.status}`);
+        if (!uploadRes.ok) {
+          const errText = await uploadRes.text();
+          throw new Error(errText || `Upload error ${uploadRes.status}`);
+        }
 
+        const uploadData = await uploadRes.json();
         const transcriptId = uploadData.id;
 
         // 3. Poll for status
@@ -120,6 +123,10 @@ export default function NewMeeting() {
         while (!completed) {
           await sleep(3000);
           const statusRes = await fetch(`/api/transcript-status?id=${transcriptId}`);
+          if (!statusRes.ok) {
+            const errText = await statusRes.text();
+            throw new Error(errText || `Poll error ${statusRes.status}`);
+          }
           chunkResult = await statusRes.json();
 
           if (chunkResult.status === 'completed') {

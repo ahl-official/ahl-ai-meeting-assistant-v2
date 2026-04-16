@@ -66,7 +66,7 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
       try {
         // Use robust chunking logic for live recordings too
         const audioBuffer = await decodeAudioFile(blob);
-        const chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 60);
+        const chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 30);
         const totalChunks = chunks.length;
         const results = [];
 
@@ -79,9 +79,12 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
             body: chunks[i].blob,
           });
 
-          const uploadData = await uploadRes.json();
-          if (!uploadRes.ok || uploadData.error) throw new Error(uploadData.error || `Upload error ${uploadRes.status}`);
+          if (!uploadRes.ok) {
+            const errText = await uploadRes.text();
+            throw new Error(errText || `Upload error ${uploadRes.status}`);
+          }
 
+          const uploadData = await uploadRes.json();
           const transcriptId = uploadData.id;
 
           let completed = false;
@@ -89,6 +92,10 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
           while (!completed) {
             await sleep(3000);
             const statusRes = await fetch(`/api/transcript-status?id=${transcriptId}`);
+            if (!statusRes.ok) {
+              const errText = await statusRes.text();
+              throw new Error(errText || `Poll error ${statusRes.status}`);
+            }
             chunkResult = await statusRes.json();
 
             if (chunkResult.status === 'completed') {
