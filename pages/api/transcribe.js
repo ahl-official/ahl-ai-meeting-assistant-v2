@@ -1,6 +1,14 @@
 // ============================================================
 // pages/api/transcribe.js
+// Chunked AssemblyAI transcription pipeline (300s chunks)
 // ============================================================
+
+import fs from 'fs/promises';
+import path from 'path';
+import os from 'os';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import ffmpegPath from 'ffmpeg-static';
 
 export const config = {
     api: {
@@ -9,174 +17,397 @@ export const config = {
     },
 };
 
-/**
- * Convert Gemini's plain timestamped text into SRT format.
- * Filters out filler-only entries (Hmm, Uh, Um etc.) that
- * Gemini hallucinates during silence.
- */
-function toSRT(text) {
-    const regex = /\((\d+:\d{2}(?::\d{2})?)\)\s*(.*?)(?=\(\d|$)/gs;
-    const entries = [];
-    let match;
+const execFileAsync = promisify(execFile);
+const CHUNK_SECONDS = 300;
+const MAX_CONCURRENT_CHUNKS = 5;
+const POLL_INTERVAL_MS = 2500;
 
-    while ((match = regex.exec(text)) !== null) {
-        const timeStr = match[1];
-        const content = match[2].trim();
-        if (!content) continue;
-
-        const parts = timeStr.split(':').map(Number);
-        const seconds = parts.length === 3
-            ? parts[0] * 3600 + parts[1] * 60 + parts[2]
-            : parts[0] * 60 + parts[1];
-
-        entries.push({ seconds, content });
-    }
-
-    // ── FIX: drop filler-only lines Gemini hallucinates for silence ──
-    const FILLER = /^(hmm+|uh+|um+|ah+|oh+|huh|mm+|err+|hm+)\.?$/i;
-    const filtered = entries.filter(e => !FILLER.test(e.content.trim()));
-
-    if (!filtered.length) {
-        // No real content found at all — return single block
-        const cleanText = text
-            .replace(/\(\d+:\d{2}(?::\d{2})?\)\s*/g, '')  // strip timestamps
-            .replace(FILLER, '')                             // strip fillers
-            .trim();
-        if (!cleanText) return '';
-        return `1\n00:00:00,000 --> 00:00:10,000\n${cleanText}\n`;
-    }
-
-    const toSRTTime = (s) => {
-        const h = Math.floor(s / 3600).toString().padStart(2, '0');
-        const m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
-        const sec = (s % 60).toString().padStart(2, '0');
-        return `${h}:${m}:${sec},000`;
-    };
-
-    return filtered.map((entry, i) => {
-        const start = toSRTTime(entry.seconds);
-        const endSec = filtered[i + 1] ? filtered[i + 1].seconds : entry.seconds + 5;
-        const end = toSRTTime(endSec);
-        return `${i + 1}\n${start} --> ${end}\n${entry.content}`;
-    }).join('\n\n') + '\n';
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * Clean raw transcript by removing filler-only timestamp lines.
- * Keeps the timestamped format but strips the noise.
- */
+function readRequestBuffer(req) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => resolve(Buffer.concat(chunks)));
+        req.on('error', reject);
+    });
+}
+
 function cleanTranscript(text) {
+    if (!text) return '';
     const FILLER = /^(hmm+|uh+|um+|ah+|oh+|huh|mm+|err+|hm+)\.?$/i;
-    // Remove entire "(m:ss) Hmm." lines
-    return text
-        .replace(/\(\d+:\d{2}(?::\d{2})?\)\s*(hmm+|uh+|um+|ah+|oh+|huh|mm+|err+|hm+)\.?\s*/gi, '')
-        .replace(/\n{3,}/g, '\n')  // collapse multiple blank lines
+    return String(text)
+        .split('\n')
+        .filter(line => !FILLER.test(line.trim()))
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
         .trim();
 }
 
-export default async function handler(req, res) {
-    if (req.method !== 'POST') return res.status(405).end();
+function formatSrtTime(ms) {
+    const totalMs = Math.max(0, Math.floor(ms));
+    const hours = Math.floor(totalMs / 3600000);
+    const minutes = Math.floor((totalMs % 3600000) / 60000);
+    const seconds = Math.floor((totalMs % 60000) / 1000);
+    const millis = totalMs % 1000;
 
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: 'OPENROUTER_API_KEY not set' });
+    const pad = (n, len = 2) => String(n).padStart(len, '0');
+    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)},${pad(millis, 3)}`;
+}
 
-    // ── Read raw audio buffer ─────────────────────────────────
-    const chunks = [];
-    await new Promise((resolve, reject) => {
-        req.on('data', chunk => chunks.push(chunk));
-        req.on('end', resolve);
-        req.on('error', reject);
-    });
+function speakerPrefix(speaker) {
+    if (speaker === undefined || speaker === null || speaker === '') return '';
+    const speakerNum = Number(speaker);
+    if (Number.isFinite(speakerNum)) return `Speaker ${speakerNum + 1}: `;
+    return `Speaker ${String(speaker)}: `;
+}
 
-    const audioBuffer = Buffer.concat(chunks);
-    if (!audioBuffer.length) {
-        return res.status(400).json({ error: 'No audio data received' });
+function buildCuesFromUtterances(utterances, offsetMs) {
+    if (!Array.isArray(utterances) || !utterances.length) return [];
+
+    return utterances
+        .filter(u => u && typeof u.text === 'string' && u.text.trim())
+        .map(u => {
+            const startMs = (Number(u.start) || 0) + offsetMs;
+            const endMs = (Number(u.end) || Number(u.start) || 0) + offsetMs;
+            return {
+                startMs,
+                endMs: Math.max(endMs, startMs + 800),
+                text: `${speakerPrefix(u.speaker)}${u.text.trim()}`,
+            };
+        });
+}
+
+function buildCuesFromWords(words, offsetMs) {
+    if (!Array.isArray(words) || !words.length) return [];
+
+    const cues = [];
+    let buffer = [];
+    let cueStart = null;
+    let cueEnd = null;
+
+    const flush = () => {
+        if (!buffer.length || cueStart === null || cueEnd === null) return;
+        cues.push({
+            startMs: cueStart,
+            endMs: Math.max(cueEnd, cueStart + 800),
+            text: buffer.join(' ').trim(),
+        });
+        buffer = [];
+        cueStart = null;
+        cueEnd = null;
+    };
+
+    for (const w of words) {
+        const text = String(w.text || '').trim();
+        if (!text) continue;
+
+        const startMs = (Number(w.start) || 0) + offsetMs;
+        const endMs = (Number(w.end) || Number(w.start) || 0) + offsetMs;
+
+        if (cueStart === null) cueStart = startMs;
+        cueEnd = endMs;
+        buffer.push(text);
+
+        const endsSentence = /[.?!]$/.test(text);
+        const tooLongByWords = buffer.length >= 12;
+        const tooLongByTime = cueEnd - cueStart >= 4500;
+
+        if (endsSentence || tooLongByWords || tooLongByTime) {
+            flush();
+        }
     }
 
-    // Detect MIME type from file header bytes
-    const header = audioBuffer.slice(0, 12);
-    let mimeType = 'audio/mpeg';
-    if (header[0] === 0x1A && header[1] === 0x45) mimeType = 'audio/webm';
-    else if (header.toString('ascii', 0, 4) === 'RIFF') mimeType = 'audio/wav';
-    else if (header.toString('ascii', 4, 8) === 'ftyp') mimeType = 'audio/mp4';
-    else if (header[0] === 0x4F && header[1] === 0x67) mimeType = 'audio/ogg';
-    else if (header[0] === 0x66 && header[1] === 0x4C) mimeType = 'audio/flac';
+    flush();
+    return cues;
+}
 
-    const base64Audio = audioBuffer.toString('base64');
+function buildSrtFromChunks(chunkResults) {
+    const cues = [];
 
-    // ── FIX: improved prompt that stops Gemini hallucinating ──
-    const prompt = `Transcribe this audio exactly as spoken.
+    for (const chunk of chunkResults) {
+        const offsetMs = Number(chunk.offsetMs) || 0;
+        const utterances = Array.isArray(chunk.utterances) ? chunk.utterances : [];
+        const words = Array.isArray(chunk.words) ? chunk.words : [];
 
-Rules:
-- Add a timestamp only at the start of each new sentence or meaningful spoken phrase, in format (m:ss) e.g. (0:00) or (1:23)
-- Do NOT add a timestamp for every second — only when someone actually says something new
-- If there is silence, background noise, or very short filler sounds (like breathing, brief "hmm", ambient noise) with no real words — skip them entirely, leave them out
-- Only transcribe actual words and sentences that carry meaning
-- If multiple speakers are clearly distinguishable, prefix lines with Speaker 1: or Speaker 2: etc.
-- Keep all actual spoken words exactly as said — do not summarise, paraphrase or clean up
-- Output plain text only, no markdown, no bullet points`;
-
-    let raw = '';
-    try {
-        const orRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-                'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000',
-                'X-Title': 'AI Meeting Assistant',
-            },
-            body: JSON.stringify({
-                model: 'google/gemini-2.5-flash-lite',
-                messages: [
-                    {
-                        role: 'user',
-                        content: [
-                            {
-                                type: 'input_audio',
-                                input_audio: {
-                                    data: base64Audio,
-                                    format: mimeType,
-                                },
-                            },
-                            {
-                                type: 'text',
-                                text: prompt,
-                            },
-                        ],
-                    },
-                ],
-                temperature: 0.1,
-                max_tokens: 8000,
-            }),
-        });
-
-        if (!orRes.ok) {
-            const errText = await orRes.text();
-            return res.status(502).json({
-                error: `OpenRouter error: ${orRes.status}`,
-                detail: errText,
+        if (utterances.length) {
+            cues.push(...buildCuesFromUtterances(utterances, offsetMs));
+        } else if (words.length) {
+            cues.push(...buildCuesFromWords(words, offsetMs));
+        } else if (chunk.text && chunk.text.trim()) {
+            cues.push({
+                startMs: offsetMs,
+                endMs: offsetMs + CHUNK_SECONDS * 1000,
+                text: chunk.text.trim(),
             });
         }
-
-        const orData = await orRes.json();
-        raw = orData.choices?.[0]?.message?.content || '';
-
-        if (!raw) {
-            return res.status(500).json({ error: 'Gemini returned empty transcription' });
-        }
-
-    } catch (ex) {
-        return res.status(500).json({ error: 'Transcription failed: ' + ex.message });
     }
 
-    // ── Clean raw transcript and build SRT ────────────────────
-    const transcript = cleanTranscript(raw);
-    const srt = toSRT(raw);
-
-    return res.json({
-        status: 'completed',
-        transcript,
-        srt,
+    cues.sort((a, b) => {
+        if (a.startMs !== b.startMs) return a.startMs - b.startMs;
+        return a.endMs - b.endMs;
     });
+
+    return cues
+        .map((cue, index) => {
+            return `${index + 1}\n${formatSrtTime(cue.startMs)} --> ${formatSrtTime(cue.endMs)}\n${cue.text}`;
+        })
+        .join('\n\n') + (cues.length ? '\n' : '');
+}
+
+async function splitAudioIntoChunks(inputPath, outputDir) {
+    if (!ffmpegPath) {
+        throw new Error('ffmpeg-static binary not found. Install ffmpeg-static or provide ffmpeg on the server.');
+    }
+
+    const outputPattern = path.join(outputDir, 'chunk_%03d.mp3');
+
+    await execFileAsync(
+        ffmpegPath,
+        [
+            '-y',
+            '-i', inputPath,
+            '-map', '0:a:0',
+            '-vn',
+            '-acodec', 'libmp3lame',
+            '-b:a', '128k',
+            '-f', 'segment',
+            '-segment_time', String(CHUNK_SECONDS),
+            '-reset_timestamps', '1',
+            outputPattern,
+        ],
+        {
+            windowsHide: true,
+            maxBuffer: 1024 * 1024 * 16,
+        }
+    );
+}
+
+async function uploadChunkToAssemblyAI(chunkBuffer, apiKey) {
+    const uploadRes = await fetch('https://api.assemblyai.com/v2/upload', {
+        method: 'POST',
+        headers: {
+            'Authorization': apiKey,
+            'Content-Type': 'application/octet-stream',
+        },
+        body: chunkBuffer,
+    });
+
+    if (!uploadRes.ok) {
+        const errText = await uploadRes.text();
+        throw new Error(`AssemblyAI upload failed (${uploadRes.status}): ${errText}`);
+    }
+
+    const uploadData = await uploadRes.json();
+    if (!uploadData.upload_url) {
+        throw new Error('AssemblyAI upload returned no upload_url');
+    }
+
+    return uploadData.upload_url;
+}
+
+async function startTranscriptJob(uploadUrl, apiKey) {
+    const transcriptRes = await fetch('https://api.assemblyai.com/v2/transcript', {
+        method: 'POST',
+        headers: {
+            'Authorization': apiKey,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            audio_url: uploadUrl,
+            speaker_labels: true,
+            punctuate: true,
+            format_text: true,
+            disfluencies: false,
+            auto_highlights: false,
+        }),
+    });
+
+    if (!transcriptRes.ok) {
+        const errText = await transcriptRes.text();
+        throw new Error(`AssemblyAI transcript start failed (${transcriptRes.status}): ${errText}`);
+    }
+
+    const transcriptData = await transcriptRes.json();
+    if (!transcriptData.id) {
+        throw new Error('AssemblyAI transcript job returned no id');
+    }
+
+    return transcriptData.id;
+}
+
+async function waitForTranscript(transcriptId, apiKey) {
+    while (true) {
+        const statusRes = await fetch(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
+            method: 'GET',
+            headers: {
+                'Authorization': apiKey,
+            },
+        });
+
+        if (!statusRes.ok) {
+            const errText = await statusRes.text();
+            throw new Error(`AssemblyAI status poll failed (${statusRes.status}): ${errText}`);
+        }
+
+        const data = await statusRes.json();
+
+        if (data.status === 'completed') {
+            return data;
+        }
+
+        if (data.status === 'error') {
+            throw new Error(data.error || 'AssemblyAI returned transcription error');
+        }
+
+        await sleep(POLL_INTERVAL_MS);
+    }
+}
+
+async function processChunk(chunkPath, chunkIndex, apiKey) {
+    const chunkBuffer = await fs.readFile(chunkPath);
+    const uploadUrl = await uploadChunkToAssemblyAI(chunkBuffer, apiKey);
+    const transcriptId = await startTranscriptJob(uploadUrl, apiKey);
+    const data = await waitForTranscript(transcriptId, apiKey);
+
+    const offsetMs = chunkIndex * CHUNK_SECONDS * 1000;
+
+    const utterances = Array.isArray(data.utterances)
+        ? data.utterances.map(u => ({
+            speaker: u.speaker,
+            text: u.text,
+            start: (Number(u.start) || 0) + offsetMs,
+            end: (Number(u.end) || Number(u.start) || 0) + offsetMs,
+        }))
+        : [];
+
+    const words = Array.isArray(data.words)
+        ? data.words.map(w => ({
+            text: w.text,
+            start: (Number(w.start) || 0) + offsetMs,
+            end: (Number(w.end) || Number(w.start) || 0) + offsetMs,
+        }))
+        : [];
+
+    return {
+        chunkIndex,
+        offsetMs,
+        text: String(data.text || '').trim(),
+        utterances,
+        words,
+    };
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    let active = 0;
+
+    return new Promise((resolve, reject) => {
+        const launch = () => {
+            if (nextIndex >= items.length && active === 0) {
+                resolve(results);
+                return;
+            }
+
+            while (active < limit && nextIndex < items.length) {
+                const current = nextIndex++;
+                active++;
+
+                Promise.resolve(worker(items[current], current))
+                    .then(result => {
+                        results[current] = result;
+                    })
+                    .catch(reject)
+                    .finally(() => {
+                        active--;
+                        launch();
+                    });
+            }
+        };
+
+        launch();
+    });
+}
+
+async function cleanupDir(dirPath) {
+    try {
+        await fs.rm(dirPath, { recursive: true, force: true });
+    } catch {
+        // ignore cleanup errors
+    }
+}
+
+export default async function handler(req, res) {
+    if (req.method !== 'POST') {
+        return res.status(405).end();
+    }
+
+    const apiKey = process.env.ASSEMBLYAI_API_KEY;
+    if (!apiKey) {
+        return res.status(500).json({ error: 'ASSEMBLYAI_API_KEY not set' });
+    }
+
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'meeting-audio-'));
+    const inputPath = path.join(tempRoot, 'input.bin');
+    const chunksDir = path.join(tempRoot, 'chunks');
+
+    try {
+        const audioBuffer = await readRequestBuffer(req);
+        if (!audioBuffer.length) {
+            return res.status(400).json({ error: 'No audio data received' });
+        }
+
+        await fs.writeFile(inputPath, audioBuffer);
+        await fs.mkdir(chunksDir, { recursive: true });
+
+        await splitAudioIntoChunks(inputPath, chunksDir);
+
+        const chunkFiles = (await fs.readdir(chunksDir))
+            .filter(name => /^chunk_\d+\.mp3$/i.test(name))
+            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+        if (!chunkFiles.length) {
+            throw new Error('No audio chunks were created');
+        }
+
+        const chunkItems = chunkFiles.map((fileName, index) => ({
+            chunkIndex: index,
+            chunkPath: path.join(chunksDir, fileName),
+        }));
+
+        const chunkResults = await mapWithConcurrency(
+            chunkItems,
+            MAX_CONCURRENT_CHUNKS,
+            async (item) => processChunk(item.chunkPath, item.chunkIndex, apiKey)
+        );
+
+        const ordered = chunkResults
+            .filter(Boolean)
+            .sort((a, b) => a.chunkIndex - b.chunkIndex);
+
+        const transcript = cleanTranscript(
+            ordered
+                .map(chunk => chunk.text)
+                .filter(Boolean)
+                .join('\n\n')
+        );
+
+        const srt = buildSrtFromChunks(ordered);
+
+        return res.status(200).json({
+            status: 'completed',
+            transcript,
+            srt,
+            chunks: ordered.length,
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: `Transcription failed: ${error.message}`,
+        });
+    } finally {
+        await cleanupDir(tempRoot);
+    }
 }
