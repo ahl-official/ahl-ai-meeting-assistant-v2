@@ -217,6 +217,7 @@ async function startTranscriptJob(uploadUrl, apiKey) {
         },
         body: JSON.stringify({
             audio_url: uploadUrl,
+            speech_models: ['universal-2'],
             speaker_labels: true,
             punctuate: true,
             format_text: true,
@@ -340,6 +341,10 @@ async function cleanupDir(dirPath) {
     }
 }
 
+// Size threshold (bytes) above which LiveRecorder uses the direct-upload path.
+// Exported so LiveRecorder can import it rather than duplicating the constant.
+export const LARGE_AUDIO_THRESHOLD = 4 * 1024 * 1024; // 4 MB
+
 export default async function handler(req, res) {
     if (req.method !== 'POST') {
         return res.status(405).end();
@@ -350,6 +355,52 @@ export default async function handler(req, res) {
         return res.status(500).json({ error: 'ASSEMBLYAI_API_KEY not set' });
     }
 
+    // ── Path A: Large file — client already uploaded to AssemblyAI ────────
+    // LiveRecorder POSTs { upload_url } as JSON when blob > LARGE_AUDIO_THRESHOLD.
+    // We skip ffmpeg entirely and go straight to job creation + polling,
+    // mirroring the chunk-process-merge pattern in analyze.js.
+    const contentType = (req.headers['content-type'] || '').toLowerCase();
+    if (contentType.includes('application/json')) {
+        let body;
+        try {
+            body = await new Promise((resolve, reject) => {
+                let raw = '';
+                req.on('data', chunk => { raw += chunk; });
+                req.on('end', () => resolve(JSON.parse(raw)));
+                req.on('error', reject);
+            });
+        } catch {
+            return res.status(400).json({ error: 'Invalid JSON body' });
+        }
+
+        const { upload_url } = body;
+        if (!upload_url) {
+            return res.status(400).json({ error: 'Missing upload_url' });
+        }
+
+        try {
+            const transcriptId = await startTranscriptJob(upload_url, apiKey);
+            const data = await waitForTranscript(transcriptId, apiKey);
+
+            const transcript = cleanTranscript(String(data.text || '').trim());
+
+            // Reuse buildSrtFromChunks with a single chunk (offsetMs = 0)
+            const singleChunk = {
+                chunkIndex: 0,
+                offsetMs: 0,
+                text: String(data.text || '').trim(),
+                utterances: Array.isArray(data.utterances) ? data.utterances : [],
+                words: Array.isArray(data.words) ? data.words : [],
+            };
+            const srt = buildSrtFromChunks([singleChunk]);
+
+            return res.status(200).json({ status: 'completed', transcript, srt, chunks: 1 });
+        } catch (error) {
+            return res.status(500).json({ error: `Transcription failed: ${error.message}` });
+        }
+    }
+
+    // ── Path B: Small file — binary blob, existing ffmpeg pipeline ────────
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'meeting-audio-'));
     const inputPath = path.join(tempRoot, 'input.bin');
     const chunksDir = path.join(tempRoot, 'chunks');

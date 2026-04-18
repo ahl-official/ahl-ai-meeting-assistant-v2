@@ -9,11 +9,62 @@ function getSupportedMimeType() {
   return '';
 }
 
+// ── Upload helpers ────────────────────────────────────────────
+// Vercel serverless functions cap request bodies at 4.5 MB.
+// For blobs above this threshold we stream through /api/aai-upload
+// (an Edge function with no body-size limit) to get an AssemblyAI
+// upload_url, then hand only that URL to /api/transcribe.
+// Small blobs go directly to /api/transcribe as before.
+// Either way the API key never leaves the server.
+
+const LARGE_AUDIO_THRESHOLD = 4 * 1024 * 1024; // 4 MB
+
+async function transcribeBlob(blob, onProgress) {
+  let transcribeBody;
+  let transcribeHeaders;
+
+  if (blob.size > LARGE_AUDIO_THRESHOLD) {
+    // ── Large file: two-step path via edge proxy ──────────────
+    onProgress?.('Uploading audio…');
+    const uploadRes = await fetch('/api/aai-upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: blob,
+    });
+
+    const uploadData = await uploadRes.json();
+    if (!uploadRes.ok || !uploadData.upload_url) {
+      throw new Error(uploadData.error || `Upload failed (${uploadRes.status})`);
+    }
+
+    transcribeBody = JSON.stringify({ upload_url: uploadData.upload_url });
+    transcribeHeaders = { 'Content-Type': 'application/json' };
+  } else {
+    // ── Small file: single-step path ──────────────────────────
+    transcribeBody = blob;
+    transcribeHeaders = { 'Content-Type': 'application/octet-stream' };
+  }
+
+  onProgress?.('Transcribing… please wait');
+  const res = await fetch('/api/transcribe', {
+    method: 'POST',
+    headers: transcribeHeaders,
+    body: transcribeBody,
+  });
+
+  const data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error || `Server error ${res.status}`);
+  if (data.status !== 'completed' || !data.transcript) throw new Error('Transcription returned empty result');
+
+  return data; // { transcript, srt, chunks }
+}
+
 export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
   const [state, setState] = useState('idle');
   const [transcript, setTranscript] = useState('');
-  const [srt, setSrt] = useState('');                  // ← FIX: store SRT
+  const [srt, setSrt] = useState('');
   const [duration, setDuration] = useState(0);
+  const [uploadProgress, setUploadProgress] = useState('');
   const [error, setError] = useState('');
 
   const mediaRecorderRef = useRef(null);
@@ -28,6 +79,7 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
     setError('');
     setTranscript('');
     setSrt('');
+    setUploadProgress('');
     chunksRef.current = [];
     setState('recording');
 
@@ -55,38 +107,42 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
       if (e.data.size > 0) chunksRef.current.push(e.data);
     };
 
+    recorder.onerror = (e) => {
+      setError(`Recording error: ${e.error}`);
+    };
+
     recorder.onstop = async () => {
       setState('transcribing');
+
+      if (chunksRef.current.length === 0) {
+        setError('No audio recorded. Please try again.');
+        setState('idle');
+        return;
+      }
+
       const mime = getSupportedMimeType() || 'audio/webm';
       const blob = new Blob(chunksRef.current, { type: mime });
 
+      if (blob.size === 0) {
+        setError('Recording is empty (0 bytes). Microphone may not be working.');
+        setState('idle');
+        return;
+      }
+
       try {
-        const res = await fetch('/api/transcribe', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: blob,
-        });
-
-        const data = await res.json();
-
-        if (!res.ok || data.error) {
-          throw new Error(data.error || `Server error ${res.status}`);
-        }
-
-        if (data.status !== 'completed' || !data.transcript) {
-          throw new Error('Transcription returned empty result');
-        }
+        const data = await transcribeBlob(blob, (msg) => setUploadProgress(msg));
 
         setTranscript(data.transcript);
-        if (data.srt) setSrt(data.srt);              // ← FIX: store SRT locally
+        if (data.srt) setSrt(data.srt);
+        setUploadProgress('');
 
         onTranscriptUpdate?.(data.transcript);
-        onComplete?.(data.transcript, durationRef.current, data.srt);  // ← FIX: pass srt as 3rd arg
+        onComplete?.(data.transcript, durationRef.current, data.srt);
 
         setState('stopped');
-
       } catch (err) {
         setError(`Transcription failed: ${err.message}`);
+        setUploadProgress('');
         setState('idle');
       }
     };
@@ -155,7 +211,10 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
         {state === 'transcribing' && (
           <div className={styles.recording}>
             <span className="spinner" style={{ marginRight: 8 }} />
-            <span>Transcribing… please wait</span>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span>Transcribing… please wait</span>
+              {uploadProgress && <span style={{ fontSize: 12, opacity: 0.7 }}>{uploadProgress}</span>}
+            </div>
           </div>
         )}
 
