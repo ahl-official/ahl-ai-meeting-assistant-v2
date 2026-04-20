@@ -12,7 +12,7 @@ import ffmpegPath from 'ffmpeg-static';
 
 export const config = {
     api: {
-        bodyParser: false,
+        bodyParser: false,   // we read the raw stream ourselves
         responseLimit: false,
     },
 };
@@ -23,13 +23,13 @@ const MAX_CONCURRENT_CHUNKS = 5;
 const POLL_INTERVAL_MS = 2500;
 
 function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function readRequestBuffer(req) {
     return new Promise((resolve, reject) => {
         const chunks = [];
-        req.on('data', chunk => chunks.push(chunk));
+        req.on('data', (chunk) => chunks.push(chunk));
         req.on('end', () => resolve(Buffer.concat(chunks)));
         req.on('error', reject);
     });
@@ -40,7 +40,7 @@ function cleanTranscript(text) {
     const FILLER = /^(hmm+|uh+|um+|ah+|oh+|huh|mm+|err+|hm+)\.?$/i;
     return String(text)
         .split('\n')
-        .filter(line => !FILLER.test(line.trim()))
+        .filter((line) => !FILLER.test(line.trim()))
         .join('\n')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
@@ -48,11 +48,10 @@ function cleanTranscript(text) {
 
 function formatSrtTime(ms) {
     const totalMs = Math.max(0, Math.floor(ms));
-    const hours = Math.floor(totalMs / 3600000);
-    const minutes = Math.floor((totalMs % 3600000) / 60000);
-    const seconds = Math.floor((totalMs % 60000) / 1000);
-    const millis = totalMs % 1000;
-
+    const hours = Math.floor(totalMs / 3_600_000);
+    const minutes = Math.floor((totalMs % 3_600_000) / 60_000);
+    const seconds = Math.floor((totalMs % 60_000) / 1_000);
+    const millis = totalMs % 1_000;
     const pad = (n, len = 2) => String(n).padStart(len, '0');
     return `${pad(hours)}:${pad(minutes)}:${pad(seconds)},${pad(millis, 3)}`;
 }
@@ -66,10 +65,9 @@ function speakerPrefix(speaker) {
 
 function buildCuesFromUtterances(utterances, offsetMs) {
     if (!Array.isArray(utterances) || !utterances.length) return [];
-
     return utterances
-        .filter(u => u && typeof u.text === 'string' && u.text.trim())
-        .map(u => {
+        .filter((u) => u && typeof u.text === 'string' && u.text.trim())
+        .map((u) => {
             const startMs = (Number(u.start) || 0) + offsetMs;
             const endMs = (Number(u.end) || Number(u.start) || 0) + offsetMs;
             return {
@@ -103,7 +101,6 @@ function buildCuesFromWords(words, offsetMs) {
     for (const w of words) {
         const text = String(w.text || '').trim();
         if (!text) continue;
-
         const startMs = (Number(w.start) || 0) + offsetMs;
         const endMs = (Number(w.end) || Number(w.start) || 0) + offsetMs;
 
@@ -115,9 +112,7 @@ function buildCuesFromWords(words, offsetMs) {
         const tooLongByWords = buffer.length >= 12;
         const tooLongByTime = cueEnd - cueStart >= 4500;
 
-        if (endsSentence || tooLongByWords || tooLongByTime) {
-            flush();
-        }
+        if (endsSentence || tooLongByWords || tooLongByTime) flush();
     }
 
     flush();
@@ -136,7 +131,7 @@ function buildSrtFromChunks(chunkResults) {
             cues.push(...buildCuesFromUtterances(utterances, offsetMs));
         } else if (words.length) {
             cues.push(...buildCuesFromWords(words, offsetMs));
-        } else if (chunk.text && chunk.text.trim()) {
+        } else if (chunk.text?.trim()) {
             cues.push({
                 startMs: offsetMs,
                 endMs: offsetMs + CHUNK_SECONDS * 1000,
@@ -145,21 +140,20 @@ function buildSrtFromChunks(chunkResults) {
         }
     }
 
-    cues.sort((a, b) => {
-        if (a.startMs !== b.startMs) return a.startMs - b.startMs;
-        return a.endMs - b.endMs;
-    });
+    cues.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
 
-    return cues
-        .map((cue, index) => {
-            return `${index + 1}\n${formatSrtTime(cue.startMs)} --> ${formatSrtTime(cue.endMs)}\n${cue.text}`;
-        })
-        .join('\n\n') + (cues.length ? '\n' : '');
+    return (
+        cues
+            .map((cue, i) => `${i + 1}\n${formatSrtTime(cue.startMs)} --> ${formatSrtTime(cue.endMs)}\n${cue.text}`)
+            .join('\n\n') + (cues.length ? '\n' : '')
+    );
 }
 
 async function splitAudioIntoChunks(inputPath, outputDir) {
     if (!ffmpegPath) {
-        throw new Error('ffmpeg-static binary not found. Install ffmpeg-static or provide ffmpeg on the server.');
+        throw new Error(
+            'ffmpeg-static binary not found. Install ffmpeg-static or provide ffmpeg on the server.'
+        );
     }
 
     const outputPattern = path.join(outputDir, 'chunk_%03d.mp3');
@@ -178,10 +172,7 @@ async function splitAudioIntoChunks(inputPath, outputDir) {
             '-reset_timestamps', '1',
             outputPattern,
         ],
-        {
-            windowsHide: true,
-            maxBuffer: 1024 * 1024 * 16,
-        }
+        { windowsHide: true, maxBuffer: 1024 * 1024 * 16 }
     );
 }
 
@@ -189,7 +180,7 @@ async function uploadChunkToAssemblyAI(chunkBuffer, apiKey) {
     const uploadRes = await fetch('https://api.assemblyai.com/v2/upload', {
         method: 'POST',
         headers: {
-            'Authorization': apiKey,
+            Authorization: apiKey,
             'Content-Type': 'application/octet-stream',
         },
         body: chunkBuffer,
@@ -201,10 +192,7 @@ async function uploadChunkToAssemblyAI(chunkBuffer, apiKey) {
     }
 
     const uploadData = await uploadRes.json();
-    if (!uploadData.upload_url) {
-        throw new Error('AssemblyAI upload returned no upload_url');
-    }
-
+    if (!uploadData.upload_url) throw new Error('AssemblyAI upload returned no upload_url');
     return uploadData.upload_url;
 }
 
@@ -212,7 +200,7 @@ async function startTranscriptJob(uploadUrl, apiKey) {
     const transcriptRes = await fetch('https://api.assemblyai.com/v2/transcript', {
         method: 'POST',
         headers: {
-            'Authorization': apiKey,
+            Authorization: apiKey,
             'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -232,10 +220,7 @@ async function startTranscriptJob(uploadUrl, apiKey) {
     }
 
     const transcriptData = await transcriptRes.json();
-    if (!transcriptData.id) {
-        throw new Error('AssemblyAI transcript job returned no id');
-    }
-
+    if (!transcriptData.id) throw new Error('AssemblyAI transcript job returned no id');
     return transcriptData.id;
 }
 
@@ -243,9 +228,7 @@ async function waitForTranscript(transcriptId, apiKey) {
     while (true) {
         const statusRes = await fetch(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
             method: 'GET',
-            headers: {
-                'Authorization': apiKey,
-            },
+            headers: { Authorization: apiKey },
         });
 
         if (!statusRes.ok) {
@@ -255,13 +238,8 @@ async function waitForTranscript(transcriptId, apiKey) {
 
         const data = await statusRes.json();
 
-        if (data.status === 'completed') {
-            return data;
-        }
-
-        if (data.status === 'error') {
-            throw new Error(data.error || 'AssemblyAI returned transcription error');
-        }
+        if (data.status === 'completed') return data;
+        if (data.status === 'error') throw new Error(data.error || 'AssemblyAI returned transcription error');
 
         await sleep(POLL_INTERVAL_MS);
     }
@@ -276,7 +254,7 @@ async function processChunk(chunkPath, chunkIndex, apiKey) {
     const offsetMs = chunkIndex * CHUNK_SECONDS * 1000;
 
     const utterances = Array.isArray(data.utterances)
-        ? data.utterances.map(u => ({
+        ? data.utterances.map((u) => ({
             speaker: u.speaker,
             text: u.text,
             start: (Number(u.start) || 0) + offsetMs,
@@ -285,20 +263,14 @@ async function processChunk(chunkPath, chunkIndex, apiKey) {
         : [];
 
     const words = Array.isArray(data.words)
-        ? data.words.map(w => ({
+        ? data.words.map((w) => ({
             text: w.text,
             start: (Number(w.start) || 0) + offsetMs,
             end: (Number(w.end) || Number(w.start) || 0) + offsetMs,
         }))
         : [];
 
-    return {
-        chunkIndex,
-        offsetMs,
-        text: String(data.text || '').trim(),
-        utterances,
-        words,
-    };
+    return { chunkIndex, offsetMs, text: String(data.text || '').trim(), utterances, words };
 }
 
 async function mapWithConcurrency(items, limit, worker) {
@@ -312,61 +284,43 @@ async function mapWithConcurrency(items, limit, worker) {
                 resolve(results);
                 return;
             }
-
             while (active < limit && nextIndex < items.length) {
                 const current = nextIndex++;
                 active++;
-
                 Promise.resolve(worker(items[current], current))
-                    .then(result => {
-                        results[current] = result;
-                    })
+                    .then((result) => { results[current] = result; })
                     .catch(reject)
-                    .finally(() => {
-                        active--;
-                        launch();
-                    });
+                    .finally(() => { active--; launch(); });
             }
         };
-
         launch();
     });
 }
 
 async function cleanupDir(dirPath) {
-    try {
-        await fs.rm(dirPath, { recursive: true, force: true });
-    } catch {
-        // ignore cleanup errors
-    }
+    try { await fs.rm(dirPath, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
-// Size threshold (bytes) above which LiveRecorder uses the direct-upload path.
-// Exported so LiveRecorder can import it rather than duplicating the constant.
-export const LARGE_AUDIO_THRESHOLD = 4 * 1024 * 1024; // 4 MB
-
 export default async function handler(req, res) {
-    if (req.method !== 'POST') {
-        return res.status(405).end();
-    }
+    if (req.method !== 'POST') return res.status(405).end();
 
     const apiKey = process.env.ASSEMBLYAI_API_KEY;
-    if (!apiKey) {
-        return res.status(500).json({ error: 'ASSEMBLYAI_API_KEY not set' });
-    }
+    if (!apiKey) return res.status(500).json({ error: 'ASSEMBLYAI_API_KEY not set' });
 
-    // ── Path A: Large file — client already uploaded to AssemblyAI ────────
-    // LiveRecorder POSTs { upload_url } as JSON when blob > LARGE_AUDIO_THRESHOLD.
-    // We skip ffmpeg entirely and go straight to job creation + polling,
-    // mirroring the chunk-process-merge pattern in analyze.js.
     const contentType = (req.headers['content-type'] || '').toLowerCase();
+
+    // ── Path A: Large file — client already uploaded to AssemblyAI ───────────
+    // LiveRecorder POSTs { upload_url } as JSON when blob > LARGE_AUDIO_THRESHOLD.
+    // We skip FFmpeg entirely and go straight to job creation + polling.
     if (contentType.includes('application/json')) {
         let body;
         try {
             body = await new Promise((resolve, reject) => {
                 let raw = '';
-                req.on('data', chunk => { raw += chunk; });
-                req.on('end', () => resolve(JSON.parse(raw)));
+                req.on('data', (chunk) => { raw += chunk; });
+                req.on('end', () => {
+                    try { resolve(JSON.parse(raw)); } catch (e) { reject(e); }
+                });
                 req.on('error', reject);
             });
         } catch {
@@ -374,17 +328,13 @@ export default async function handler(req, res) {
         }
 
         const { upload_url } = body;
-        if (!upload_url) {
-            return res.status(400).json({ error: 'Missing upload_url' });
-        }
+        if (!upload_url) return res.status(400).json({ error: 'Missing upload_url' });
 
         try {
             const transcriptId = await startTranscriptJob(upload_url, apiKey);
             const data = await waitForTranscript(transcriptId, apiKey);
-
             const transcript = cleanTranscript(String(data.text || '').trim());
 
-            // Reuse buildSrtFromChunks with a single chunk (offsetMs = 0)
             const singleChunk = {
                 chunkIndex: 0,
                 offsetMs: 0,
@@ -400,29 +350,24 @@ export default async function handler(req, res) {
         }
     }
 
-    // ── Path B: Small file — binary blob, existing ffmpeg pipeline ────────
+    // ── Path B: Small file — raw binary blob, FFmpeg pipeline ────────────────
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'meeting-audio-'));
     const inputPath = path.join(tempRoot, 'input.bin');
     const chunksDir = path.join(tempRoot, 'chunks');
 
     try {
         const audioBuffer = await readRequestBuffer(req);
-        if (!audioBuffer.length) {
-            return res.status(400).json({ error: 'No audio data received' });
-        }
+        if (!audioBuffer.length) return res.status(400).json({ error: 'No audio data received' });
 
         await fs.writeFile(inputPath, audioBuffer);
         await fs.mkdir(chunksDir, { recursive: true });
-
         await splitAudioIntoChunks(inputPath, chunksDir);
 
         const chunkFiles = (await fs.readdir(chunksDir))
-            .filter(name => /^chunk_\d+\.mp3$/i.test(name))
+            .filter((name) => /^chunk_\d+\.mp3$/i.test(name))
             .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
-        if (!chunkFiles.length) {
-            throw new Error('No audio chunks were created');
-        }
+        if (!chunkFiles.length) throw new Error('No audio chunks were created');
 
         const chunkItems = chunkFiles.map((fileName, index) => ({
             chunkIndex: index,
@@ -432,7 +377,7 @@ export default async function handler(req, res) {
         const chunkResults = await mapWithConcurrency(
             chunkItems,
             MAX_CONCURRENT_CHUNKS,
-            async (item) => processChunk(item.chunkPath, item.chunkIndex, apiKey)
+            (item) => processChunk(item.chunkPath, item.chunkIndex, apiKey)
         );
 
         const ordered = chunkResults
@@ -440,24 +385,13 @@ export default async function handler(req, res) {
             .sort((a, b) => a.chunkIndex - b.chunkIndex);
 
         const transcript = cleanTranscript(
-            ordered
-                .map(chunk => chunk.text)
-                .filter(Boolean)
-                .join('\n\n')
+            ordered.map((c) => c.text).filter(Boolean).join('\n\n')
         );
-
         const srt = buildSrtFromChunks(ordered);
 
-        return res.status(200).json({
-            status: 'completed',
-            transcript,
-            srt,
-            chunks: ordered.length,
-        });
+        return res.status(200).json({ status: 'completed', transcript, srt, chunks: ordered.length });
     } catch (error) {
-        return res.status(500).json({
-            error: `Transcription failed: ${error.message}`,
-        });
+        return res.status(500).json({ error: `Transcription failed: ${error.message}` });
     } finally {
         await cleanupDir(tempRoot);
     }

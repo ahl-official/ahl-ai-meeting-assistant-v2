@@ -9,52 +9,74 @@ function getSupportedMimeType() {
   return '';
 }
 
-// ── Upload helpers ────────────────────────────────────────────
-// Vercel serverless functions cap request bodies at 4.5 MB.
-// For blobs above this threshold we stream through /api/aai-upload
-// (an Edge function with no body-size limit) to get an AssemblyAI
-// upload_url, then hand only that URL to /api/transcribe.
-// Small blobs go directly to /api/transcribe as before.
-// Either way the API key never leaves the server.
+// Vercel serverless functions cap request bodies at ~4.5 MB.
+// We use 2 MB as our threshold to give a safe margin for framing overhead.
+// Blobs above this go through /api/aai-upload (Edge, no body limit) first,
+// which returns an AssemblyAI upload_url we hand to /api/transcribe as JSON.
+// Small blobs go directly to /api/transcribe as a binary octet stream.
+// The API key never leaves the server in either path.
 
-const LARGE_AUDIO_THRESHOLD = 4 * 1024 * 1024; // 4 MB
+const LARGE_AUDIO_THRESHOLD = 2 * 1024 * 1024; // 2 MB — safe margin below Vercel's 4.5 MB limit
+
+async function safeJson(res) {
+  // Guard against Vercel infrastructure errors (413, 502, etc.) that return
+  // plain-text bodies like "Request Entity Too Large" instead of JSON.
+  // Without this, res.json() throws "Unexpected token 'R'…" which is opaque.
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    let text;
+    try { text = await res.text(); } catch { text = `HTTP ${res.status}`; }
+    throw new Error(text.slice(0, 300));
+  }
+  return data;
+}
 
 async function transcribeBlob(blob, onProgress) {
   let transcribeBody;
   let transcribeHeaders;
 
   if (blob.size > LARGE_AUDIO_THRESHOLD) {
-    // ── Large file: two-step path via edge proxy ──────────────
+    // ── Large file: two-step path via Edge proxy ──────────────────────────
+    // Step 1: stream the raw blob to our Edge function which forwards it to
+    // AssemblyAI's /v2/upload endpoint and returns { upload_url }.
     onProgress?.('Uploading audio…');
+
     const uploadRes = await fetch('/api/aai-upload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/octet-stream' },
       body: blob,
     });
 
-    const uploadData = await uploadRes.json();
+    const uploadData = await safeJson(uploadRes);
     if (!uploadRes.ok || !uploadData.upload_url) {
       throw new Error(uploadData.error || `Upload failed (${uploadRes.status})`);
     }
 
+    // Step 2: pass the remote URL to /api/transcribe so it never touches the blob
     transcribeBody = JSON.stringify({ upload_url: uploadData.upload_url });
     transcribeHeaders = { 'Content-Type': 'application/json' };
   } else {
-    // ── Small file: single-step path ──────────────────────────
+    // ── Small file: single-step binary path ───────────────────────────────
     transcribeBody = blob;
     transcribeHeaders = { 'Content-Type': 'application/octet-stream' };
   }
 
   onProgress?.('Transcribing… please wait');
+
   const res = await fetch('/api/transcribe', {
     method: 'POST',
     headers: transcribeHeaders,
     body: transcribeBody,
   });
 
-  const data = await res.json();
+  const data = await safeJson(res);
+
   if (!res.ok || data.error) throw new Error(data.error || `Server error ${res.status}`);
-  if (data.status !== 'completed' || !data.transcript) throw new Error('Transcription returned empty result');
+  if (data.status !== 'completed' || !data.transcript) {
+    throw new Error('Transcription returned empty result');
+  }
 
   return data; // { transcript, srt, chunks }
 }
@@ -73,7 +95,8 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
   const timerRef = useRef(null);
   const durationRef = useRef(0);
 
-  const fmt = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  const fmt = (s) =>
+    `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
   const startRecording = async () => {
     setError('');
@@ -158,11 +181,10 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
 
   const stopRecording = () => {
     clearInterval(timerRef.current);
-    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current?.getTracks().forEach((t) => t.stop());
     mediaRecorderRef.current?.stop();
   };
 
-  // ── SRT download helper ────────────────────────────────────
   const downloadSRT = () => {
     const blob = new Blob([srt], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
@@ -181,10 +203,13 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
     setDuration(0);
   };
 
-  useEffect(() => () => {
-    clearInterval(timerRef.current);
-    streamRef.current?.getTracks().forEach(t => t.stop());
-  }, []);
+  useEffect(
+    () => () => {
+      clearInterval(timerRef.current);
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+    },
+    []
+  );
 
   return (
     <div className={styles.recorder}>
@@ -213,7 +238,9 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
             <span className="spinner" style={{ marginRight: 8 }} />
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               <span>Transcribing… please wait</span>
-              {uploadProgress && <span style={{ fontSize: 12, opacity: 0.7 }}>{uploadProgress}</span>}
+              {uploadProgress && (
+                <span style={{ fontSize: 12, opacity: 0.7 }}>{uploadProgress}</span>
+              )}
             </div>
           </div>
         )}
