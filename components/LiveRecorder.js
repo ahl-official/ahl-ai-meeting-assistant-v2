@@ -9,18 +9,7 @@ function getSupportedMimeType() {
   return '';
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Upload strategy: browser → AssemblyAI directly (Vercel never sees the blob)
-//
-// 1. GET /api/aai-token  → server mints a one-time AssemblyAI upload URL
-// 2. Browser PUTs blob straight to that URL (no Vercel in the path)
-// 3. POST /api/transcribe with { upload_url } → tiny JSON, server polls + returns transcript
-// ─────────────────────────────────────────────────────────────────────────────
-
 async function safeJson(res, label) {
-  // If the server returns plain text (e.g. Vercel's "Request Entity Too Large")
-  // instead of JSON, this surfaces the actual message rather than the cryptic
-  // "Unexpected token 'R'" parse error.
   if (!res.ok) {
     let text;
     try { text = await res.text(); } catch { text = `HTTP ${res.status}`; }
@@ -36,29 +25,18 @@ async function safeJson(res, label) {
 }
 
 async function transcribeBlob(blob, onProgress) {
-  // ── Step 1: get a one-time upload URL from our server ────────────────────
-  onProgress?.('Preparing upload…');
-  const tokenRes = await fetch('/api/aai-token');
-  const tokenData = await safeJson(tokenRes, 'aai-token');
-  if (!tokenData.upload_url) {
-    throw new Error('[aai-token] No upload_url in response');
-  }
-
-  // ── Step 2: PUT blob directly from browser to AssemblyAI ─────────────────
-  // This goes browser → AssemblyAI — Vercel is not in the path at all.
+  // ── Step 1: stream blob to AssemblyAI via proxy (bypasses Vercel size limit)
   onProgress?.('Uploading audio…');
-  const uploadRes = await fetch(tokenData.upload_url, {
-    method: 'PUT',
+  const uploadRes = await fetch('/api/aai-upload', {
+    method: 'POST',
     headers: { 'Content-Type': blob.type || 'application/octet-stream' },
     body: blob,
   });
-  const uploadData = await safeJson(uploadRes, 'assemblyai-upload');
-  const audioUrl = uploadData.upload_url || uploadData.audio_url || uploadData.url;
-  if (!audioUrl) {
-    throw new Error('[assemblyai-upload] No audio URL in response: ' + JSON.stringify(uploadData));
-  }
+  const uploadData = await safeJson(uploadRes, 'aai-upload');
+  const audioUrl = uploadData.upload_url;
+  if (!audioUrl) throw new Error('[aai-upload] No upload_url in response');
 
-  // ── Step 3: transcribe via our server (sends only a short JSON body) ──────
+  // ── Step 2: send the URL to our transcribe endpoint (tiny JSON body)
   onProgress?.('Transcribing… please wait');
   const transcribeRes = await fetch('/api/transcribe', {
     method: 'POST',
@@ -71,7 +49,7 @@ async function transcribeBlob(blob, onProgress) {
     throw new Error('[transcribe] Returned empty result');
   }
 
-  return data; // { transcript, srt, chunks }
+  return data;
 }
 
 export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
@@ -154,8 +132,6 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
         onComplete?.(data.transcript, durationRef.current, data.srt);
         setState('stopped');
       } catch (err) {
-        // The error message now includes a [step-name] prefix so you can see
-        // exactly which fetch failed, e.g. "[aai-token] HTTP 413: Request En..."
         setError(`Transcription failed: ${err.message}`);
         setUploadProgress('');
         setState('idle');

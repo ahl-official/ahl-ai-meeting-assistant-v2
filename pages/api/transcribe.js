@@ -1,8 +1,3 @@
-// ============================================================
-// pages/api/transcribe.js
-// Chunked AssemblyAI transcription pipeline (300s chunks)
-// ============================================================
-
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
@@ -12,7 +7,7 @@ import ffmpegPath from 'ffmpeg-static';
 
 export const config = {
     api: {
-        bodyParser: false,   // we read the raw stream ourselves
+        bodyParser: false,
         responseLimit: false,
     },
 };
@@ -151,9 +146,7 @@ function buildSrtFromChunks(chunkResults) {
 
 async function splitAudioIntoChunks(inputPath, outputDir) {
     if (!ffmpegPath) {
-        throw new Error(
-            'ffmpeg-static binary not found. Install ffmpeg-static or provide ffmpeg on the server.'
-        );
+        throw new Error('ffmpeg-static binary not found.');
     }
 
     const outputPattern = path.join(outputDir, 'chunk_%03d.mp3');
@@ -239,7 +232,7 @@ async function waitForTranscript(transcriptId, apiKey) {
         const data = await statusRes.json();
 
         if (data.status === 'completed') return data;
-        if (data.status === 'error') throw new Error(data.error || 'AssemblyAI returned transcription error');
+        if (data.status === 'error') throw new Error(data.error || 'AssemblyAI transcription error');
 
         await sleep(POLL_INTERVAL_MS);
     }
@@ -309,9 +302,7 @@ export default async function handler(req, res) {
 
     const contentType = (req.headers['content-type'] || '').toLowerCase();
 
-    // ── Path A: Large file — client already uploaded to AssemblyAI ───────────
-    // LiveRecorder POSTs { upload_url } as JSON when blob > LARGE_AUDIO_THRESHOLD.
-    // We skip FFmpeg entirely and go straight to job creation + polling.
+    // ── Path A: { upload_url } JSON — skip FFmpeg, go straight to transcription
     if (contentType.includes('application/json')) {
         let body;
         try {
@@ -350,7 +341,7 @@ export default async function handler(req, res) {
         }
     }
 
-    // ── Path B: Small file — raw binary blob, FFmpeg pipeline ────────────────
+    // ── Path B: raw binary blob — FFmpeg chunking pipeline
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'meeting-audio-'));
     const inputPath = path.join(tempRoot, 'input.bin');
     const chunksDir = path.join(tempRoot, 'chunks');
