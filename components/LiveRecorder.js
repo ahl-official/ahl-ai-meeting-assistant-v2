@@ -9,19 +9,25 @@ function getSupportedMimeType() {
   return '';
 }
 
-// Vercel serverless functions cap request bodies at ~4.5 MB.
-// We use 2 MB as our threshold to give a safe margin for framing overhead.
-// Blobs above this go through /api/aai-upload (Edge, no body limit) first,
-// which returns an AssemblyAI upload_url we hand to /api/transcribe as JSON.
-// Small blobs go directly to /api/transcribe as a binary octet stream.
-// The API key never leaves the server in either path.
-
-const LARGE_AUDIO_THRESHOLD = 2 * 1024 * 1024; // 2 MB — safe margin below Vercel's 4.5 MB limit
+// ─────────────────────────────────────────────────────────────────────────────
+// Upload strategy: browser → AssemblyAI directly (Vercel never sees the blob)
+//
+// Why: Vercel enforces a ~4.5 MB request body limit at the infrastructure
+// level — it applies to both serverless AND Edge functions. Any recording
+// longer than ~2-3 minutes will exceed this and return a plain-text
+// "Request Entity Too Large" response before your handler even runs.
+//
+// Solution: the browser uploads the blob straight to AssemblyAI.
+//   1. GET /api/aai-token  → server asks AssemblyAI for a one-time upload URL
+//      and returns it. The API key never leaves the server.
+//   2. Browser PUTs the blob directly to that AssemblyAI URL (no Vercel hop).
+//   3. POST /api/transcribe with { upload_url } → tiny JSON body, server polls
+//      AssemblyAI and returns the completed transcript.
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function safeJson(res) {
-  // Guard against Vercel infrastructure errors (413, 502, etc.) that return
-  // plain-text bodies like "Request Entity Too Large" instead of JSON.
-  // Without this, res.json() throws "Unexpected token 'R'…" which is opaque.
+  // Prevents the opaque "Unexpected token 'R'" crash when Vercel (or any
+  // server) returns a plain-text error instead of JSON.
   let data;
   try {
     data = await res.json();
@@ -34,45 +40,43 @@ async function safeJson(res) {
 }
 
 async function transcribeBlob(blob, onProgress) {
-  let transcribeBody;
-  let transcribeHeaders;
-
-  if (blob.size > LARGE_AUDIO_THRESHOLD) {
-    // ── Large file: two-step path via Edge proxy ──────────────────────────
-    // Step 1: stream the raw blob to our Edge function which forwards it to
-    // AssemblyAI's /v2/upload endpoint and returns { upload_url }.
-    onProgress?.('Uploading audio…');
-
-    const uploadRes = await fetch('/api/aai-upload', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: blob,
-    });
-
-    const uploadData = await safeJson(uploadRes);
-    if (!uploadRes.ok || !uploadData.upload_url) {
-      throw new Error(uploadData.error || `Upload failed (${uploadRes.status})`);
-    }
-
-    // Step 2: pass the remote URL to /api/transcribe so it never touches the blob
-    transcribeBody = JSON.stringify({ upload_url: uploadData.upload_url });
-    transcribeHeaders = { 'Content-Type': 'application/json' };
-  } else {
-    // ── Small file: single-step binary path ───────────────────────────────
-    transcribeBody = blob;
-    transcribeHeaders = { 'Content-Type': 'application/octet-stream' };
+  // ── Step 1: get a one-time AssemblyAI upload URL from our server ──────────
+  onProgress?.('Preparing upload…');
+  const tokenRes = await fetch('/api/aai-token');
+  const tokenData = await safeJson(tokenRes);
+  if (!tokenRes.ok || !tokenData.upload_url) {
+    throw new Error(tokenData.error || `Failed to get upload URL (${tokenRes.status})`);
   }
 
-  onProgress?.('Transcribing… please wait');
+  // ── Step 2: PUT blob directly from browser to AssemblyAI ─────────────────
+  // This request goes browser → AssemblyAI — Vercel is not in the path,
+  // so no body-size limit applies regardless of recording length.
+  onProgress?.('Uploading audio…');
+  const uploadRes = await fetch(tokenData.upload_url, {
+    method: 'PUT',
+    headers: { 'Content-Type': blob.type || 'application/octet-stream' },
+    body: blob,
+  });
 
+  if (!uploadRes.ok) {
+    const txt = await uploadRes.text().catch(() => '');
+    throw new Error(`Audio upload failed (${uploadRes.status}): ${txt.slice(0, 200)}`);
+  }
+
+  const uploadData = await safeJson(uploadRes);
+  // AssemblyAI returns the permanent audio URL — accept any of the known field names
+  const audioUrl = uploadData.upload_url || uploadData.audio_url || uploadData.url;
+  if (!audioUrl) throw new Error('AssemblyAI did not return an audio URL after upload');
+
+  // ── Step 3: transcribe via our server (tiny JSON body, no size issue) ─────
+  onProgress?.('Transcribing… please wait');
   const res = await fetch('/api/transcribe', {
     method: 'POST',
-    headers: transcribeHeaders,
-    body: transcribeBody,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ upload_url: audioUrl }),
   });
 
   const data = await safeJson(res);
-
   if (!res.ok || data.error) throw new Error(data.error || `Server error ${res.status}`);
   if (data.status !== 'completed' || !data.transcript) {
     throw new Error('Transcription returned empty result');
