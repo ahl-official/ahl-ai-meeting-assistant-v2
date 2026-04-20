@@ -15,6 +15,8 @@ export default async function handler(req, res) {
     res.json({
         status: data.status,
         transcript: data.text || '',
+        utterances: data.utterances || [],
+        words: data.words || [],
         error: data.error || null,
     });
 }

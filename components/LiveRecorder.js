@@ -1,102 +1,192 @@
-import React, { useRef, useState } from "react";
+import { useState, useRef, useEffect } from 'react';
+import styles from '../styles/LiveRecorder.module.css';
 
-const MAX_BATCH_BYTES = 2 * 1024 * 1024; // 2MB safe
+function getSupportedMimeType() {
+  const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg'];
+  for (const type of types) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return '';
+}
 
-export default function LiveRecorder({ onComplete }) {
+export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
+  const [state, setState] = useState('idle');
+  const [transcript, setTranscript] = useState('');
+  const [srt, setSrt] = useState('');                  // ← FIX: store SRT
+  const [duration, setDuration] = useState(0);
+  const [error, setError] = useState('');
+
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
 
   const pendingChunksRef = useRef([]);
   const pendingSizeRef = useRef(0);
 
-  const transcriptPartsRef = useRef([]);
+  const fmt = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
-  const [recording, setRecording] = useState(false);
+  const startRecording = async () => {
+    setError('');
+    setTranscript('');
+    setSrt('');
+    chunksRef.current = [];
+    setState('recording');
 
-  // 🔹 Send chunk to backend
-  async function transcribeChunk(blob) {
-    const res = await fetch("/api/transcribe", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/octet-stream",
-      },
-      body: blob,
-    });
-
-    if (!res.ok) {
-      throw new Error("Transcription failed");
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+    } catch (err) {
+      setState('idle');
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setError('Microphone access denied. Allow microphone in your browser settings.');
+      } else if (err.name === 'NotFoundError') {
+        setError('No microphone found. Please connect one and try again.');
+      } else {
+        setError(`Microphone error: ${err.message}`);
+      }
+      return;
     }
 
-    const data = await res.json();
-    return data.transcript;
-  }
+    const mimeType = getSupportedMimeType();
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+    mediaRecorderRef.current = recorder;
 
-  // 🔹 Flush batch when limit reached
-  async function flushBatch() {
-    if (pendingChunksRef.current.length === 0) return;
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunksRef.current.push(e.data);
+    };
 
-    const blob = new Blob(pendingChunksRef.current, {
-      type: "audio/webm",
-    });
+    recorder.onstop = async () => {
+      setState('transcribing');
+      const mime = getSupportedMimeType() || 'audio/webm';
+      const blob = new Blob(chunksRef.current, { type: mime });
 
-    pendingChunksRef.current = [];
-    pendingSizeRef.current = 0;
+      try {
+        const res = await fetch('/api/transcribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: blob,
+        });
 
-    const transcript = await transcribeChunk(blob);
-    transcriptPartsRef.current.push(transcript);
-  }
+        const data = await res.json();
 
-  // 🔹 Start recording
-  async function startRecording() {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    streamRef.current = stream;
+        if (!res.ok || data.error) {
+          throw new Error(data.error || `Server error ${res.status}`);
+        }
 
-    const recorder = new MediaRecorder(stream, {
-      mimeType: "audio/webm",
-    });
+        if (data.status !== 'completed' || !data.transcript) {
+          throw new Error('Transcription returned empty result');
+        }
 
-    recorder.ondataavailable = async (e) => {
-      if (!e.data.size) return;
+        setTranscript(data.transcript);
+        if (data.srt) setSrt(data.srt);              // ← FIX: store SRT locally
 
-      pendingChunksRef.current.push(e.data);
-      pendingSizeRef.current += e.data.size;
+        onTranscriptUpdate?.(data.transcript);
+        onComplete?.(data.transcript, durationRef.current, data.srt);  // ← FIX: pass srt as 3rd arg
 
-      // 🚨 Flush before hitting Vercel limit
-      if (pendingSizeRef.current >= MAX_BATCH_BYTES) {
-        recorder.pause();
-        await flushBatch();
-        recorder.resume();
+        setState('stopped');
+
+      } catch (err) {
+        setError(`Transcription failed: ${err.message}`);
+        setState('idle');
       }
     };
 
-    recorder.start(1000); // 1 sec chunks
-    mediaRecorderRef.current = recorder;
-    setRecording(true);
-  }
+    recorder.start(1000);
+    durationRef.current = 0;
+    setDuration(0);
+    timerRef.current = setInterval(() => {
+      durationRef.current += 1;
+      setDuration(durationRef.current);
+    }, 1000);
+  };
 
-  // 🔹 Stop recording
-  async function stopRecording() {
-    mediaRecorderRef.current.stop();
-    streamRef.current.getTracks().forEach((t) => t.stop());
+  const stopRecording = () => {
+    clearInterval(timerRef.current);
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    mediaRecorderRef.current?.stop();
+  };
 
-    setRecording(false);
+  // ── SRT download helper ────────────────────────────────────
+  const downloadSRT = () => {
+    const blob = new Blob([srt], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'recording-transcript.srt';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
-    // Flush remaining
-    await flushBatch();
+  const handleRecordAgain = () => {
+    setState('idle');
+    setTranscript('');
+    setSrt('');
+    durationRef.current = 0;
+    setDuration(0);
+  };
 
-    const finalTranscript = transcriptPartsRef.current.join(" ");
-
-    transcriptPartsRef.current = [];
-
-    onComplete(finalTranscript);
-  }
+  useEffect(() => () => {
+    clearInterval(timerRef.current);
+    streamRef.current?.getTracks().forEach(t => t.stop());
+  }, []);
 
   return (
-    <div>
-      {!recording ? (
-        <button onClick={startRecording}>Start Recording</button>
-      ) : (
-        <button onClick={stopRecording}>Stop Recording</button>
+    <div className={styles.recorder}>
+      <div className={styles.controls}>
+        {state === 'idle' && (
+          <button className={'btn btn-primary ' + styles.recBtn} onClick={startRecording}>
+            🎙 Start Recording
+          </button>
+        )}
+
+        {state === 'recording' && (
+          <div className={styles.recording}>
+            <div className={styles.recIndicator}>
+              <span className="rec-dot" />
+              <span className={styles.recLabel}>Recording</span>
+              <span className={styles.timer}>{fmt(duration)}</span>
+            </div>
+            <button className={'btn btn-danger'} onClick={stopRecording}>
+              ⏹ Stop
+            </button>
+          </div>
+        )}
+
+        {state === 'transcribing' && (
+          <div className={styles.recording}>
+            <span className="spinner" style={{ marginRight: 8 }} />
+            <span>Transcribing… please wait</span>
+          </div>
+        )}
+
+        {state === 'stopped' && (
+          <div className={styles.stopped}>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span className="badge badge-green">✓ Done — {fmt(duration)}</span>
+              {srt && (
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: 13, padding: '4px 12px' }}
+                  onClick={downloadSRT}
+                >
+                  ↓ Download .srt
+                </button>
+              )}
+            </div>
+            <button className={'btn btn-ghost'} onClick={handleRecordAgain}>
+              Record again
+            </button>
+          </div>
+        )}
+      </div>
+
+      {error && <div className={styles.error}>{error}</div>}
+
+      {state === 'stopped' && transcript && (
+        <div className={styles.liveTranscript}>
+          <span className={styles.liveLabel}>Transcript</span>
+          <div className={styles.transcriptText}>{transcript}</div>
+        </div>
       )}
     </div>
   );
