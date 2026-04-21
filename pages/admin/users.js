@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/router';
 import { useAuth } from '../../lib/auth';
 import { getAllUsers, getPassword, setAdmin, setActive } from '../../lib/api';
+import AdminLayout from '../../components/AdminLayout';
 import styles from '../../styles/Admin.module.css';
 
 function useAdminGuard() {
@@ -15,20 +16,17 @@ function useAdminGuard() {
 
 export default function AdminUsers() {
     const { user, ready } = useAdminGuard();
-    const router = useRouter();
     const [users, setUsers] = useState([]);
     const [fetching, setFetching] = useState(true);
     const [search, setSearch] = useState('');
-    const [filter, setFilter] = useState('all'); // 'all' | 'active' | 'inactive' | 'admin'
+    const [filter, setFilter] = useState('all');
+    const [busy, setBusy] = useState({});
 
     // Password modal
-    const [pwModal, setPwModal] = useState(null);     // { username, email }
+    const [pwModal, setPwModal] = useState(null);
     const [pwValue, setPwValue] = useState('');
     const [pwLoading, setPwLoading] = useState(false);
     const [pwCopied, setPwCopied] = useState(false);
-
-    // Busy state per user row
-    const [busy, setBusy] = useState({});
 
     useEffect(() => {
         if (!ready) return;
@@ -117,133 +115,118 @@ export default function AdminUsers() {
     if (!ready) return null;
 
     return (
-        <div className={styles.page}>
-            <main className={styles.main}>
-                <div className={styles.header}>
-                    <div className={styles.headerLeft}>
-                        <span className={styles.adminBadge}>Admin Portal</span>
-                        <h1 className={styles.title}>Users</h1>
-                        <p className={styles.subtitle}>{users.length} registered accounts</p>
+        <AdminLayout active="credentials">
+            <div className={styles.page}>
+                <main className={styles.main}>
+                    <div className={styles.header}>
+                        <div className={styles.headerLeft}>
+                            <span className={styles.adminBadge}>Admin Portal</span>
+                            <h1 className={styles.title}>User Credentials</h1>
+                            <p className={styles.subtitle}>{users.length} registered accounts</p>
+                        </div>
+                        <div className={styles.headerActions}>
+                            <button className="btn btn-secondary" onClick={loadUsers}>↻ Refresh</button>
+                        </div>
                     </div>
-                    <div className={styles.headerActions}>
-                        <button className="btn btn-secondary" onClick={() => router.push('/admin')}>
-                            ← Overview
-                        </button>
-                        <button className="btn btn-secondary" onClick={() => router.push('/admin/meetings')}>
-                            📋 Meetings
-                        </button>
-                    </div>
-                </div>
 
-                <div className={styles.toolbar}>
-                    <input
-                        className={'input ' + styles.search}
-                        placeholder="Search by name, email, phone…"
-                        value={search}
-                        onChange={e => setSearch(e.target.value)}
-                    />
-                    <select
-                        className={styles.filterSelect}
-                        value={filter}
-                        onChange={e => setFilter(e.target.value)}
-                    >
-                        <option value="all">All users</option>
-                        <option value="active">Active only</option>
-                        <option value="inactive">Inactive only</option>
-                        <option value="admin">Admins only</option>
-                    </select>
-                    <button className="btn btn-secondary" onClick={loadUsers}>↻ Refresh</button>
-                </div>
-
-                {fetching ? (
-                    <div className={styles.loading}><span className="spinner" /> Loading users…</div>
-                ) : filtered.length === 0 ? (
-                    <div className={styles.empty}>
-                        <div className={styles.emptyIcon}>👤</div>
-                        <h3>No users found</h3>
-                        <p>{search ? 'Try a different search term.' : 'No users have registered yet.'}</p>
+                    <div className={styles.toolbar}>
+                        <input
+                            className={'input ' + styles.search}
+                            placeholder="Search by name, email, phone…"
+                            value={search}
+                            onChange={e => setSearch(e.target.value)}
+                        />
+                        <select
+                            className={styles.filterSelect}
+                            value={filter}
+                            onChange={e => setFilter(e.target.value)}
+                        >
+                            <option value="all">All users</option>
+                            <option value="active">Active only</option>
+                            <option value="inactive">Inactive only</option>
+                            <option value="admin">Admins only</option>
+                        </select>
                     </div>
-                ) : (
-                    <div className={styles.tableWrap}>
-                        <table className={styles.table}>
-                            <thead>
-                                <tr>
-                                    <th>Username</th>
-                                    <th>Email</th>
-                                    <th>Phone</th>
-                                    <th>Joined</th>
-                                    <th>Status</th>
-                                    <th>Role</th>
-                                    <th style={{ textAlign: 'right' }}>Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {filtered.map((u, i) => (
-                                    <tr key={i}>
-                                        <td>
-                                            <span className={styles.usernameCell}>{u.username}</span>
-                                        </td>
-                                        <td>
-                                            <span className={styles.emailCell}>{u.email || '—'}</span>
-                                        </td>
-                                        <td>
-                                            <span className={styles.emailCell}>{u.phone || '—'}</span>
-                                        </td>
-                                        <td>
-                                            <span style={{ fontSize: 12, color: 'var(--gray-400)' }}>
-                                                {u.createdAt
-                                                    ? new Date(u.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-                                                    : '—'}
-                                            </span>
-                                        </td>
-                                        <td>
-                                            <span className={'badge ' + (u.active ? 'badge-green' : 'badge-gray')}>
-                                                {u.active ? 'Active' : 'Inactive'}
-                                            </span>
-                                        </td>
-                                        <td>
-                                            {u.isAdmin && (
-                                                <span className="badge badge-blue">Admin</span>
-                                            )}
-                                        </td>
-                                        <td>
-                                            <div className={styles.tdActions}>
-                                                <button
-                                                    className="btn btn-sm btn-primary"
-                                                    onClick={() => handleGetPassword(u)}
-                                                    title="Retrieve password"
-                                                >
-                                                    🔑 Password
-                                                </button>
-                                                <button
-                                                    className={'btn btn-sm ' + (u.active ? 'btn-danger' : 'btn-secondary')}
-                                                    onClick={() => handleToggleActive(u)}
-                                                    disabled={busy[u.username + '_active']}
-                                                    title={u.active ? 'Deactivate account' : 'Activate account'}
-                                                >
-                                                    {busy[u.username + '_active'] ? '…' : (u.active ? 'Deactivate' : 'Activate')}
-                                                </button>
-                                                {u.username !== user.username && (
-                                                    <button
-                                                        className={'btn btn-sm ' + (u.isAdmin ? 'btn-danger' : 'btn-secondary')}
-                                                        onClick={() => handleToggleAdmin(u)}
-                                                        disabled={busy[u.username + '_admin']}
-                                                        title={u.isAdmin ? 'Revoke admin' : 'Grant admin'}
-                                                    >
-                                                        {busy[u.username + '_admin'] ? '…' : (u.isAdmin ? 'Revoke Admin' : 'Make Admin')}
-                                                    </button>
-                                                )}
-                                            </div>
-                                        </td>
+
+                    {fetching ? (
+                        <div className={styles.loading}><span className="spinner" /> Loading users…</div>
+                    ) : filtered.length === 0 ? (
+                        <div className={styles.empty}>
+                            <div className={styles.emptyIcon}>👤</div>
+                            <h3>No users found</h3>
+                            <p>{search ? 'Try a different search term.' : 'No users have registered yet.'}</p>
+                        </div>
+                    ) : (
+                        <div className={styles.tableWrap}>
+                            <table className={styles.table}>
+                                <thead>
+                                    <tr>
+                                        <th>Username</th>
+                                        <th>Email</th>
+                                        <th>Phone</th>
+                                        <th>Joined</th>
+                                        <th>Status</th>
+                                        <th>Role</th>
+                                        <th style={{ textAlign: 'right' }}>Actions</th>
                                     </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    </div>
-                )}
-            </main>
+                                </thead>
+                                <tbody>
+                                    {filtered.map((u, i) => (
+                                        <tr key={i}>
+                                            <td><span className={styles.usernameCell}>{u.username}</span></td>
+                                            <td><span className={styles.emailCell}>{u.email || '—'}</span></td>
+                                            <td><span className={styles.emailCell}>{u.phone || '—'}</span></td>
+                                            <td>
+                                                <span style={{ fontSize: 12, color: 'var(--gray-400)' }}>
+                                                    {u.createdAt
+                                                        ? new Date(u.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                                                        : '—'}
+                                                </span>
+                                            </td>
+                                            <td>
+                                                <span className={'badge ' + (u.active ? 'badge-green' : 'badge-gray')}>
+                                                    {u.active ? 'Active' : 'Inactive'}
+                                                </span>
+                                            </td>
+                                            <td>
+                                                {u.isAdmin && <span className="badge badge-blue">Admin</span>}
+                                            </td>
+                                            <td>
+                                                <div className={styles.tdActions}>
+                                                    <button
+                                                        className="btn btn-sm btn-primary"
+                                                        onClick={() => handleGetPassword(u)}
+                                                    >
+                                                        🔑 Password
+                                                    </button>
+                                                    <button
+                                                        className={'btn btn-sm ' + (u.active ? 'btn-danger' : 'btn-secondary')}
+                                                        onClick={() => handleToggleActive(u)}
+                                                        disabled={busy[u.username + '_active']}
+                                                    >
+                                                        {busy[u.username + '_active'] ? '…' : (u.active ? 'Deactivate' : 'Activate')}
+                                                    </button>
+                                                    {u.username !== user.username && (
+                                                        <button
+                                                            className={'btn btn-sm ' + (u.isAdmin ? 'btn-danger' : 'btn-secondary')}
+                                                            onClick={() => handleToggleAdmin(u)}
+                                                            disabled={busy[u.username + '_admin']}
+                                                        >
+                                                            {busy[u.username + '_admin'] ? '…' : (u.isAdmin ? 'Revoke Admin' : 'Make Admin')}
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                </main>
+            </div>
 
-            {/* ── Password modal ── */}
+            {/* Password modal */}
             {pwModal && (
                 <div className={styles.overlay} onClick={() => setPwModal(null)}>
                     <div className={styles.modal} onClick={e => e.stopPropagation()}>
@@ -257,23 +240,16 @@ export default function AdminUsers() {
                             <div className={styles.passwordBox}>{pwValue}</div>
                         )}
                         <div className={styles.modalActions}>
-                            <button
-                                className="btn btn-primary"
-                                onClick={handleCopy}
-                                disabled={!pwValue || pwLoading}
-                            >
+                            <button className="btn btn-primary" onClick={handleCopy} disabled={!pwValue || pwLoading}>
                                 {pwCopied ? '✓ Copied!' : '📋 Copy'}
                             </button>
-                            <button
-                                className="btn btn-secondary"
-                                onClick={() => { setPwModal(null); setPwValue(''); }}
-                            >
+                            <button className="btn btn-secondary" onClick={() => { setPwModal(null); setPwValue(''); }}>
                                 Close
                             </button>
                         </div>
                     </div>
                 </div>
             )}
-        </div>
+        </AdminLayout>
     );
 }
