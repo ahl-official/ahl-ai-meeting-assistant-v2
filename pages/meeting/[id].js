@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/router';
 import Navbar from '../../components/Navbar';
 import TaskPanel from '../../components/TaskPanel';
@@ -17,6 +17,7 @@ export default function MeetingDetail() {
   const [editData, setEditData] = useState({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [autoSaving, setAutoSaving] = useState(false);
   const [error, setError] = useState('');
   const [editingAP, setEditingAP] = useState(null);
 
@@ -29,6 +30,9 @@ export default function MeetingDetail() {
   const [waError, setWaError] = useState('');
   const [waResults, setWaResults] = useState(null);
 
+  // Debounce ref — prevents hammering Apps Script on every keystroke
+  const autoSaveTimer = useRef(null);
+
   useEffect(() => {
     if (!loading && !user) router.push('/');
   }, [user, loading]);
@@ -40,6 +44,11 @@ export default function MeetingDetail() {
   useEffect(() => {
     if (waModal && user?.phone) setUserPhone(String(user.phone));
   }, [waModal]);
+
+  // Clean up debounce timer when component unmounts
+  useEffect(() => {
+    return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current); };
+  }, []);
 
   const fetchMeeting = async () => {
     setFetching(true);
@@ -64,6 +73,7 @@ export default function MeetingDetail() {
     }
   };
 
+  // ── Manual full save (Edit tab "Save Changes" button) ─────────────────────
   const save = async () => {
     setSaving(true);
     setError('');
@@ -72,7 +82,7 @@ export default function MeetingDetail() {
       await updateMeeting(user.username, id, payload);
       setMeeting(m => ({ ...m, ...payload }));
       setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      setTimeout(() => setSaved(false), 2500);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -80,9 +90,33 @@ export default function MeetingDetail() {
     }
   };
 
-  // Called by TaskPanel whenever APs or tasks change
+  // ── Auto-save triggered by TaskPanel on every AP or task change ───────────
+  // This is the KEY fix: previously this only updated local state.
+  // Now it also persists actionPoints + tasks to Google Sheets via updateMeeting.
+  // A 600ms debounce prevents a flood of requests when the user edits quickly.
   const handleTasksPanelChange = ({ actionPoints, tasks }) => {
+    // 1. Update local state immediately so the UI stays responsive
     setEditData(d => ({ ...d, actionPoints, tasks }));
+
+    // 2. Debounced persist to Sheets
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current);
+    autoSaveTimer.current = setTimeout(async () => {
+      setAutoSaving(true);
+      try {
+        await updateMeeting(user.username, id, {
+          actionPoints,
+          tasks,
+          updatedAt: new Date().toISOString(),
+        });
+        // Keep top-level meeting state in sync (used by WhatsApp modal counts)
+        setMeeting(m => ({ ...m, actionPoints, tasks }));
+      } catch (err) {
+        console.error('[auto-save tasks]', err);
+        setError('Tasks generated but failed to save: ' + err.message);
+      } finally {
+        setAutoSaving(false);
+      }
+    }, 600);
   };
 
   const updateAP = (index, field, value) => {
@@ -96,7 +130,10 @@ export default function MeetingDetail() {
   const addAP = () => {
     setEditData(d => ({
       ...d,
-      actionPoints: [...d.actionPoints, { id: Date.now().toString(), task: '', owner: '', priority: 'medium', dueDate: 'TBD' }]
+      actionPoints: [
+        ...d.actionPoints,
+        { id: Date.now().toString(), task: '', owner: '', priority: 'medium', dueDate: 'TBD' }
+      ]
     }));
     setEditingAP(editData.actionPoints.length);
   };
@@ -139,7 +176,7 @@ export default function MeetingDetail() {
           meeting,
           userPhone: uPhone.trim() || null,
           coordinatorPhone: cPhone.trim() || null,
-          username: user?.username || null,   // ✅ fixed — now sends username
+          username: user?.username || null,
         }),
       });
       const data = await res.json();
@@ -177,12 +214,24 @@ export default function MeetingDetail() {
       <main className={styles.main}>
 
         <div className={styles.header}>
-          <button className="btn btn-ghost" onClick={() => router.push('/dashboard')}>← Meetings</button>
+          <button className="btn btn-ghost" onClick={() => router.push('/dashboard')}>
+            ← Meetings
+          </button>
           <div className={styles.headerRight}>
             <span className={styles.date}>
-              {new Date(meeting.createdAt).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+              {new Date(meeting.createdAt).toLocaleDateString('en-GB', {
+                weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
+              })}
             </span>
-            {meeting.duration > 0 && <span className="badge badge-gray">{meeting.duration} min</span>}
+            {meeting.duration > 0 && (
+              <span className="badge badge-gray">{meeting.duration} min</span>
+            )}
+            {/* Auto-save indicator — shows while debounced save is in flight */}
+            {autoSaving && (
+              <span style={{ fontSize: 12, color: 'var(--gray-400)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                <span className="spinner" style={{ width: 12, height: 12 }} /> Saving…
+              </span>
+            )}
             <button
               className="btn btn-secondary"
               style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}
@@ -288,17 +337,31 @@ export default function MeetingDetail() {
                 <h2 className={styles.cardTitle}>Decisions</h2>
                 {editData.decisions?.map((d, i) => (
                   <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-                    <input className="input" value={d} onChange={e => {
-                      const arr = [...editData.decisions];
-                      arr[i] = e.target.value;
-                      setEditData(ed => ({ ...ed, decisions: arr }));
-                    }} />
-                    <button className="btn btn-danger" style={{ padding: '8px 10px' }} onClick={() => {
-                      setEditData(ed => ({ ...ed, decisions: ed.decisions.filter((_, j) => j !== i) }));
-                    }}>✕</button>
+                    <input
+                      className="input"
+                      value={d}
+                      onChange={e => {
+                        const arr = [...editData.decisions];
+                        arr[i] = e.target.value;
+                        setEditData(ed => ({ ...ed, decisions: arr }));
+                      }}
+                    />
+                    <button
+                      className="btn btn-danger"
+                      style={{ padding: '8px 10px' }}
+                      onClick={() => setEditData(ed => ({
+                        ...ed, decisions: ed.decisions.filter((_, j) => j !== i)
+                      }))}
+                    >
+                      ✕
+                    </button>
                   </div>
                 ))}
-                <button className="btn btn-ghost" style={{ fontSize: 13 }} onClick={() => setEditData(d => ({ ...d, decisions: [...d.decisions, ''] }))}>
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: 13 }}
+                  onClick={() => setEditData(d => ({ ...d, decisions: [...d.decisions, ''] }))}
+                >
                   + Add decision
                 </button>
               </div>
@@ -351,8 +414,11 @@ export default function MeetingDetail() {
                   Sends the action plan summary to both numbers
                 </p>
               </div>
-              <button onClick={closeWaModal} disabled={waSending}
-                style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer', color: 'var(--gray-400)', paddingTop: 2 }}>
+              <button
+                onClick={closeWaModal}
+                disabled={waSending}
+                style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer', color: 'var(--gray-400)', paddingTop: 2 }}
+              >
                 ✕
               </button>
             </div>
@@ -388,9 +454,13 @@ export default function MeetingDetail() {
                   borderRadius: 8, padding: '10px 14px', marginBottom: 20,
                   fontSize: 13, color: 'var(--gray-600)',
                 }}>
-                  <span style={{ fontWeight: 600, color: 'var(--gray-800)' }}>{meeting.title || 'Untitled Meeting'}</span>
+                  <span style={{ fontWeight: 600, color: 'var(--gray-800)' }}>
+                    {meeting.title || 'Untitled Meeting'}
+                  </span>
                   <span style={{ marginLeft: 8, color: 'var(--gray-400)' }}>
-                    · {meeting.actionPoints?.length || 0} action points · {meeting.tasks?.length || 0} tasks · {meeting.decisions?.length || 0} decisions
+                    · {meeting.actionPoints?.length || 0} action points
+                    · {meeting.tasks?.length || 0} tasks
+                    · {meeting.decisions?.length || 0} decisions
                   </span>
                 </div>
 
@@ -398,9 +468,17 @@ export default function MeetingDetail() {
                   <label style={{ display: 'block', fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--gray-500)', marginBottom: 6 }}>
                     Your WhatsApp Number
                   </label>
-                  <input className="input" type="tel" placeholder="e.g. +91 98765 43210"
-                    value={userPhone} onChange={e => setUserPhone(e.target.value)} disabled={waSending} />
-                  <p style={{ fontSize: 11, color: 'var(--gray-400)', marginTop: 4 }}>Include country code · e.g. +91 for India</p>
+                  <input
+                    className="input"
+                    type="tel"
+                    placeholder="e.g. +91 98765 43210"
+                    value={userPhone}
+                    onChange={e => setUserPhone(e.target.value)}
+                    disabled={waSending}
+                  />
+                  <p style={{ fontSize: 11, color: 'var(--gray-400)', marginTop: 4 }}>
+                    Include country code · e.g. +91 for India
+                  </p>
                 </div>
 
                 <div style={{ marginBottom: 24 }}>
@@ -408,8 +486,14 @@ export default function MeetingDetail() {
                     Process Coordinator's Number{' '}
                     <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(optional)</span>
                   </label>
-                  <input className="input" type="tel" placeholder="e.g. +91 9987921288"
-                    value={coordPhone} onChange={e => setCoordPhone(e.target.value)} disabled={waSending} />
+                  <input
+                    className="input"
+                    type="tel"
+                    placeholder="e.g. +91 9987921288"
+                    value={coordPhone}
+                    onChange={e => setCoordPhone(e.target.value)}
+                    disabled={waSending}
+                  />
                 </div>
 
                 <div style={{ display: 'flex', gap: 10 }}>
@@ -429,7 +513,11 @@ export default function MeetingDetail() {
             )}
 
             {waStatus === 'success' && (
-              <button className="btn btn-primary" onClick={closeWaModal} style={{ width: '100%', justifyContent: 'center' }}>
+              <button
+                className="btn btn-primary"
+                onClick={closeWaModal}
+                style={{ width: '100%', justifyContent: 'center' }}
+              >
                 Done
               </button>
             )}

@@ -1,4 +1,7 @@
 // pages/api/generate-tasks.js
+// This file ONLY generates tasks via OpenRouter and returns them to the frontend.
+// Persisting tasks to Google Sheets is handled by [id].js → handleTasksPanelChange
+// which calls updateMeeting (lib/api.js → Apps Script updateMeeting action).
 
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).end();
@@ -14,17 +17,11 @@ export default async function handler(req, res) {
         return res.status(500).json({ success: false, error: 'OPENROUTER_API_KEY not set' });
     }
 
-    // Format action points as a numbered list for the prompt
     const apsText = actionPoints
-        .map(function (ap, i) {
-            return (
-                (i + 1) +
-                '. [' + (ap.priority || 'medium').toUpperCase() + '] ' +
-                (ap.task || '') +
-                ' (Owner: ' + (ap.owner || 'Unassigned') +
-                ', Due: ' + (ap.dueDate || 'TBD') + ')'
-            );
-        })
+        .map((ap, i) =>
+            `${i + 1}. [${(ap.priority || 'medium').toUpperCase()}] ${ap.task || ''}` +
+            ` (Owner: ${ap.owner || 'Unassigned'}, Due: ${ap.dueDate || 'TBD'})`
+        )
         .join('\n');
 
     const prompt = `You are a senior project manager converting meeting action points into a precise, structured Task List.
@@ -76,42 +73,39 @@ Return ONLY the JSON array. No markdown fences, no explanation, no preamble.`;
 
         if (!resp.ok) {
             const errText = await resp.text();
-            throw new Error('OpenRouter error ' + resp.status + ': ' + errText);
+            throw new Error(`OpenRouter error ${resp.status}: ${errText}`);
         }
 
         const data = await resp.json();
-        const raw = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '[]';
+        const raw = data?.choices?.[0]?.message?.content || '[]';
 
         // Strip markdown fences if model wraps in them anyway
         const clean = raw.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
 
-        // Extract first JSON array from response
         let tasks = [];
         const arrayMatch = clean.match(/\[[\s\S]*\]/);
         if (arrayMatch) {
             try {
                 tasks = JSON.parse(arrayMatch[0]);
-            } catch (parseErr) {
+            } catch {
                 tasks = [];
             }
         }
 
         if (!Array.isArray(tasks)) tasks = [];
 
-        // Normalise every task to guarantee shape
-        tasks = tasks.map(function (t) {
-            return {
-                id: Date.now().toString() + Math.random().toString(36).slice(2),
-                title: t.title || 'Untitled Task',
-                priority: t.priority || 'medium',
-                owner: t.owner || 'Unassigned',
-                dueDate: t.dueDate || 'Not specified',
-                details: Array.isArray(t.details) ? t.details : [],
-                sourceActionPoints: Array.isArray(t.sourceActionPoints) ? t.sourceActionPoints : [],
-            };
-        });
+        // Normalise every task to guarantee shape + add unique id
+        tasks = tasks.map(t => ({
+            id: Date.now().toString(36) + Math.random().toString(36).slice(2),
+            title: t.title || 'Untitled Task',
+            priority: t.priority || 'medium',
+            owner: t.owner || 'Unassigned',
+            dueDate: t.dueDate || 'Not specified',
+            details: Array.isArray(t.details) ? t.details : [],
+            sourceActionPoints: Array.isArray(t.sourceActionPoints) ? t.sourceActionPoints : [],
+        }));
 
-        return res.status(200).json({ success: true, tasks: tasks });
+        return res.status(200).json({ success: true, tasks });
 
     } catch (err) {
         console.error('[generate-tasks]', err);
