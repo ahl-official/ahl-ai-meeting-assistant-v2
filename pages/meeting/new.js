@@ -71,7 +71,7 @@ export default function NewMeeting() {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-      await saveMeeting(user.username, meeting);  // ✅ pass username
+      await saveMeeting(user.username, meeting);
       router.push(`/meeting/${meeting.id}`);
     } catch (err) {
       setError('Save failed: ' + err.message);

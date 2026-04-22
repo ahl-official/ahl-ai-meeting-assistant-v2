@@ -19,11 +19,10 @@ function toChatId(raw) {
     if (digits.length < 7) return null;
     return digits + '@c.us';
 }
-
 // ── USER MESSAGE (FULL) ───────────────────────────────────────
 
 function buildUserMessage(meeting, username) {
-    const PRIORITY_EMOJI = { high: '🔴', medium: '🟡', low: '🟢' };
+    const PRIORITY_EMOJI = { high: '🔴', medium: '🟡', low: '🟢', critical: '🔴' };
     const lines = [];
 
     if (username) {
@@ -62,16 +61,17 @@ function buildUserMessage(meeting, username) {
                 task.status === 'done' ? '✅' :
                     task.status === 'in_progress' ? '🔄' : '⬜';
 
+            // ✅ Fixed: use title (not task.task), owner (not assignee), details (not notes)
             lines.push(`${i + 1}. ${statusEmoji} *${task.title || task.task || task.name || 'Untitled task'}*`);
 
-            if (task.assignee || task.owner)
-                lines.push(`   👤 ${task.assignee || task.owner}`);
+            if (task.owner || task.assignee)
+                lines.push(`   👤 ${task.owner || task.assignee}`);
 
             if (task.dueDate)
                 lines.push(`   📅 ${task.dueDate}`);
 
-            if (task.notes || task.note)
-                lines.push(`   📎 ${task.notes || task.note}`);
+            if (task.details && task.details.length > 0)
+                task.details.forEach(d => lines.push(`   • ${d}`));
         });
         lines.push('');
     }
@@ -94,7 +94,7 @@ function buildUserMessage(meeting, username) {
     return lines.join('\n');
 }
 
-// ── COORDINATOR MESSAGE (FIXED) ───────────────────────────────
+// ── COORDINATOR MESSAGE (TASKS ONLY) ─────────────────────────
 
 function buildCoordinatorMessage(meeting, username) {
     const lines = [];
@@ -118,16 +118,17 @@ function buildCoordinatorMessage(meeting, username) {
                 task.status === 'done' ? '✅' :
                     task.status === 'in_progress' ? '🔄' : '⬜';
 
+            // ✅ Fixed: same field names as TasksPanel schema
             lines.push(`${i + 1}. ${statusEmoji} *${task.title || task.task || task.name || 'Untitled task'}*`);
 
-            if (task.assignee || task.owner)
-                lines.push(`   👤 ${task.assignee || task.owner}`);
+            if (task.owner || task.assignee)
+                lines.push(`   👤 ${task.owner || task.assignee}`);
 
             if (task.dueDate)
                 lines.push(`   📅 ${task.dueDate}`);
 
-            if (task.notes || task.note)
-                lines.push(`   📎 ${task.notes || task.note}`);
+            if (task.details && task.details.length > 0)
+                task.details.forEach(d => lines.push(`   • ${d}`));
         });
 
     } else {
@@ -139,7 +140,6 @@ function buildCoordinatorMessage(meeting, username) {
 
     return lines.join('\n');
 }
-
 // ── SEND MESSAGE ─────────────────────────────────────────────
 
 async function sendMessage(chatId, text) {
