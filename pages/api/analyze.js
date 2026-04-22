@@ -157,8 +157,8 @@ Return ONLY the JSON array. No explanation, no markdown.`;
     return true;
   });
 
-  // ── Single pass for summary + decisions using full transcript ─
-  // If transcript is very long, use first+last 2000 chars for summary context
+  // ── Single pass for summary + tasks using full transcript ────
+  // If transcript is very long, use first+last 3000 chars for context
   const summaryContext = transcript.length > 6000
     ? transcript.slice(0, 3000) + '\n[...middle truncated...]\n' + transcript.slice(-3000)
     : transcript;
@@ -173,30 +173,96 @@ Return ONLY the JSON array. No explanation, no markdown.`;
 TRANSCRIPT:
 ${summaryContext}`;
 
-  let summary = '', decisions = [], nextSteps = '';
+  // ── TASKS PROMPT — strict, project-manager grade ──────────────
+  const tasksPrompt = `You are a senior project manager distilling a meeting transcript into a precise, actionable Task List.
+
+RULES YOU MUST FOLLOW:
+1. Each task is a STANDALONE, self-contained unit of work — not a paraphrase of the transcript.
+2. Be PRECISE: capture who, what, expected output, and any constraints or dependencies.
+3. Use "details" as sub-bullets for acceptance criteria, context, or dependencies.
+4. You MAY merge several related action items into ONE task if they form a single coherent workstream.
+5. You MAY also create tasks that have NO direct action point if the transcript implies critical follow-ups.
+6. Do NOT copy-paste sentences from the transcript. Synthesise and distil.
+7. Priority must be one of: "critical" | "high" | "medium" | "low"
+
+Return ONLY a JSON array. Each element must have EXACTLY this shape:
+{
+  "title": "Imperative verb headline, max 12 words",
+  "priority": "high",
+  "owner": "Person name or 'Unassigned'",
+  "dueDate": "Specific date mentioned or 'Not specified'",
+  "details": [
+    "Sub-bullet: specific acceptance criteria, context, or dependency",
+    "Sub-bullet: deadline urgency or blocker if mentioned"
+  ],
+  "sourceActionPoints": []
+}
+
+If the meeting has no actionable work, return [].
+Return ONLY the JSON array. No markdown fences, no explanation, no preamble.
+
+TRANSCRIPT:
+${summaryContext}`;
+
+  // ── Run summary + tasks in parallel ──────────────────────────
+  let summary = '', decisions = [], nextSteps = '', tasks = [];
+
   try {
-    const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'google/gemini-2.5-flash-lite',
-        messages: [{ role: 'user', content: summaryPrompt }],
-        temperature: 0.2,
-        max_tokens: 1000,
+    const [summaryResp, tasksResp] = await Promise.all([
+      fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'google/gemini-2.5-flash-lite',
+          messages: [{ role: 'user', content: summaryPrompt }],
+          temperature: 0.2,
+          max_tokens: 1000,
+        }),
       }),
-    });
-    const data = await resp.json();
-    const text = data.choices?.[0]?.message?.content || '{}';
-    const clean = text.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(clean);
-    summary = parsed.summary || '';
-    decisions = parsed.decisions || [];
-    nextSteps = parsed.nextSteps || '';
+      fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'google/gemini-2.5-flash-lite',
+          messages: [{ role: 'user', content: tasksPrompt }],
+          temperature: 0.1,
+          max_tokens: 3000,
+        }),
+      }),
+    ]);
+
+    // Parse summary
+    try {
+      const summaryData = await summaryResp.json();
+      const summaryText = summaryData.choices?.[0]?.message?.content || '{}';
+      const parsed = JSON.parse(summaryText.replace(/```json|```/g, '').trim());
+      summary   = parsed.summary   || '';
+      decisions = parsed.decisions || [];
+      nextSteps = parsed.nextSteps || '';
+    } catch {
+      summary = 'Summary generation failed.';
+    }
+
+    // Parse tasks
+    try {
+      const tasksData = await tasksResp.json();
+      const tasksText = tasksData.choices?.[0]?.message?.content || '[]';
+      const extracted = extractJSON(tasksText);
+      tasks = Array.isArray(extracted) ? extracted : [];
+      // Normalise each task to guarantee shape
+      tasks = tasks.map(t => ({
+        title:              t.title              || 'Untitled Task',
+        priority:           t.priority           || 'medium',
+        owner:              t.owner              || 'Unassigned',
+        dueDate:            t.dueDate            || 'Not specified',
+        details:            Array.isArray(t.details) ? t.details : [],
+        sourceActionPoints: Array.isArray(t.sourceActionPoints) ? t.sourceActionPoints : [],
+      }));
+    } catch {
+      tasks = [];
+    }
   } catch (err) {
-    summary = 'Summary generation failed.';
+    summary = 'Analysis failed: ' + err.message;
   }
 
   return res.json({
@@ -204,6 +270,7 @@ ${summaryContext}`;
     result: {
       summary,
       actionPoints: deduped,
+      tasks,
       decisions,
       nextSteps,
     },

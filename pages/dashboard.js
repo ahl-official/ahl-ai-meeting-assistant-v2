@@ -24,7 +24,8 @@ export default function Dashboard() {
   const fetchMeetings = async () => {
     setFetching(true);
     try {
-      const data = await getMeetings(user.email);
+      // ✅ FIX: pass user.username — AppScript resolves username → email → sheet tab
+      const data = await getMeetings(user.username);
       setMeetings(data.meetings || []);
     } catch (err) {
       console.error(err);
@@ -37,7 +38,8 @@ export default function Dashboard() {
     if (!confirm('Delete this meeting?')) return;
     setDeleting(meetingId);
     try {
-      await deleteMeeting(user.email, meetingId);
+      // ✅ FIX: pass user.username
+      await deleteMeeting(user.username, meetingId);
       setMeetings(m => m.filter(x => x.id !== meetingId));
     } catch (err) {
       alert(err.message);

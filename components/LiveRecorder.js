@@ -9,18 +9,99 @@ function getSupportedMimeType() {
   return '';
 }
 
+// ── SRT helpers (client-side) ─────────────────────────────────
+function formatSrtTime(ms) {
+  const totalMs = Math.max(0, Math.floor(ms));
+  const h = Math.floor(totalMs / 3600000);
+  const m = Math.floor((totalMs % 3600000) / 60000);
+  const s = Math.floor((totalMs % 60000) / 1000);
+  const mil = totalMs % 1000;
+  const pad = (n, len = 2) => String(n).padStart(len, '0');
+  return `${pad(h)}:${pad(m)}:${pad(s)},${pad(mil, 3)}`;
+}
+
+function speakerPrefix(speaker) {
+  if (speaker === undefined || speaker === null || speaker === '') return '';
+  const n = Number(speaker);
+  return Number.isFinite(n) ? `Speaker ${n + 1}: ` : `Speaker ${String(speaker)}: `;
+}
+
+function buildCuesFromUtterances(utterances, offsetMs) {
+  if (!Array.isArray(utterances) || !utterances.length) return [];
+  return utterances
+    .filter(u => u && typeof u.text === 'string' && u.text.trim())
+    .map(u => {
+      const startMs = (Number(u.start) || 0) + offsetMs;
+      const endMs = (Number(u.end) || Number(u.start) || 0) + offsetMs;
+      return {
+        startMs,
+        endMs: Math.max(endMs, startMs + 800),
+        text: `${speakerPrefix(u.speaker)}${u.text.trim()}`,
+      };
+    });
+}
+
+function buildCuesFromWords(words, offsetMs) {
+  if (!Array.isArray(words) || !words.length) return [];
+  const cues = [];
+  let buffer = [], cueStart = null, cueEnd = null;
+
+  const flush = () => {
+    if (!buffer.length || cueStart === null) return;
+    cues.push({
+      startMs: cueStart,
+      endMs: Math.max(cueEnd, cueStart + 800),
+      text: buffer.join(' ').trim(),
+    });
+    buffer = [];
+    cueStart = null;
+    cueEnd = null;
+  };
+
+  for (const w of words) {
+    const text = String(w.text || '').trim();
+    if (!text) continue;
+    const startMs = (Number(w.start) || 0) + offsetMs;
+    const endMs = (Number(w.end) || Number(w.start) || 0) + offsetMs;
+    if (cueStart === null) cueStart = startMs;
+    cueEnd = endMs;
+    buffer.push(text);
+    if (/[.?!]$/.test(text) || buffer.length >= 12 || cueEnd - cueStart >= 4500) flush();
+  }
+  flush();
+  return cues;
+}
+
+function buildSrtFromChunks(chunkResults) {
+  const cues = [];
+  for (const chunk of chunkResults) {
+    const offsetMs = Number(chunk.offsetMs) || 0;
+    const utterances = Array.isArray(chunk.utterances) ? chunk.utterances : [];
+    const words = Array.isArray(chunk.words) ? chunk.words : [];
+
+    if (utterances.length) {
+      cues.push(...buildCuesFromUtterances(utterances, offsetMs));
+    } else if (words.length) {
+      cues.push(...buildCuesFromWords(words, offsetMs));
+    } else if (chunk.text?.trim()) {
+      cues.push({
+        startMs: offsetMs,
+        endMs: offsetMs + 180000,
+        text: chunk.text.trim(),
+      });
+    }
+  }
+  cues.sort((a, b) => a.startMs !== b.startMs ? a.startMs - b.startMs : a.endMs - b.endMs);
+  return (
+    cues
+      .map((c, i) => `${i + 1}\n${formatSrtTime(c.startMs)} --> ${formatSrtTime(c.endMs)}\n${c.text}`)
+      .join('\n\n') + (cues.length ? '\n' : '')
+  );
+}
+
 // ── Upload helpers ────────────────────────────────────────────
-// Vercel serverless functions cap request bodies at 4.5 MB.
-// For blobs above this threshold we stream through /api/aai-upload
-// (an Edge function with no body-size limit) to get an AssemblyAI
-// upload_url, then hand only that URL to /api/transcribe.
-// Small blobs go directly to /api/transcribe as before.
-// Either way the API key never leaves the server.
+const CHUNK_SIZE = 3 * 1024 * 1024;
 
-// ── constants ────────────────────────────────────────────────
-const CHUNK_SIZE = 3 * 1024 * 1024; // 3 MB — safely under 4.5 MB edge limit
-
-// ── split a Blob into ordered chunks ─────────────────────────
 function splitBlob(blob) {
   const chunks = [];
   let offset = 0;
@@ -31,7 +112,6 @@ function splitBlob(blob) {
   return chunks;
 }
 
-// ── upload one chunk to AssemblyAI via your edge proxy ───────
 async function uploadChunk(chunk) {
   const res = await fetch('/api/aai-upload', {
     method: 'POST',
@@ -45,7 +125,6 @@ async function uploadChunk(chunk) {
   return data.upload_url;
 }
 
-// ── transcribe one upload_url via your serverless route ──────
 async function transcribeUploadUrl(upload_url) {
   const res = await fetch('/api/transcribe-chunk', {
     method: 'POST',
@@ -54,10 +133,9 @@ async function transcribeUploadUrl(upload_url) {
   });
   const data = await res.json();
   if (!res.ok || data.error) throw new Error(data.error || `Transcribe error ${res.status}`);
-  return data; // { text, utterances, words }
+  return data; // { text, utterances, words, srt }
 }
 
-// ── main entry: replaces old transcribeBlob ──────────────────
 async function transcribeBlob(blob, onProgress) {
   const chunks = splitBlob(blob);
   const total = chunks.length;
@@ -70,14 +148,12 @@ async function transcribeBlob(blob, onProgress) {
     onProgress?.(`Transcribing part ${i + 1} of ${total}…`);
     const result = await transcribeUploadUrl(upload_url);
     results.push({ ...result, chunkIndex: i, offsetMs: i * 180000 });
-    // 180000ms = 3MB ≈ ~3min of audio at 128kbps — adjust if needed
   }
 
   onProgress?.('Merging results…');
   return mergeChunkResults(results);
 }
 
-// ── merge ordered chunk results into final transcript + SRT ──
 function mergeChunkResults(results) {
   const ordered = results.sort((a, b) => a.chunkIndex - b.chunkIndex);
 
@@ -86,10 +162,11 @@ function mergeChunkResults(results) {
     .filter(Boolean)
     .join('\n\n');
 
-  const srt = buildSrtFromChunks(ordered); // reuse your existing SRT builder
+  const srt = buildSrtFromChunks(ordered);
   return { transcript, srt, chunks: ordered.length };
 }
 
+// ── Component ─────────────────────────────────────────────────
 export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
   const [state, setState] = useState('idle');
   const [transcript, setTranscript] = useState('');
@@ -193,7 +270,6 @@ export default function LiveRecorder({ onTranscriptUpdate, onComplete }) {
     mediaRecorderRef.current?.stop();
   };
 
-  // ── SRT download helper ────────────────────────────────────
   const downloadSRT = () => {
     const blob = new Blob([srt], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);

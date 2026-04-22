@@ -13,6 +13,7 @@ import ffmpegPath from 'ffmpeg-static';
 const execFileAsync = promisify(execFile);
 const CHUNK_SECONDS = 300;
 const MAX_CONCURRENT_CHUNKS = 5;
+const POLL_INTERVAL_MS = 3000;
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));

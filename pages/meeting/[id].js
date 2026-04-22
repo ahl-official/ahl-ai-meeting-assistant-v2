@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/router';
 import Navbar from '../../components/Navbar';
+import TaskPanel from '../../components/TaskPanel';
 import { useAuth } from '../../lib/auth';
 import { getMeetings, updateMeeting } from '../../lib/api';
 import styles from '../../styles/MeetingDetail.module.css';
@@ -36,7 +37,6 @@ export default function MeetingDetail() {
     if (user && id) fetchMeeting();
   }, [user, id]);
 
-  // FIX: Coerce user.phone to string to prevent .trim() TypeError
   useEffect(() => {
     if (waModal && user?.phone) setUserPhone(String(user.phone));
   }, [waModal]);
@@ -44,7 +44,7 @@ export default function MeetingDetail() {
   const fetchMeeting = async () => {
     setFetching(true);
     try {
-      const data = await getMeetings(user.email);
+      const data = await getMeetings(user.username);
       const found = (data.meetings || []).find(m => m.id === id);
       if (!found) { router.push('/dashboard'); return; }
       setMeeting(found);
@@ -55,6 +55,7 @@ export default function MeetingDetail() {
         nextSteps: found.nextSteps,
         actionPoints: JSON.parse(JSON.stringify(found.actionPoints || [])),
         decisions: [...(found.decisions || [])],
+        tasks: JSON.parse(JSON.stringify(found.tasks || [])),
       });
     } catch (err) {
       setError(err.message);
@@ -67,8 +68,9 @@ export default function MeetingDetail() {
     setSaving(true);
     setError('');
     try {
-      await updateMeeting(user.email, id, { ...editData, updatedAt: new Date().toISOString() });
-      setMeeting(m => ({ ...m, ...editData }));
+      const payload = { ...editData, updatedAt: new Date().toISOString() };
+      await updateMeeting(user.username, id, payload);
+      setMeeting(m => ({ ...m, ...payload }));
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
@@ -76,6 +78,11 @@ export default function MeetingDetail() {
     } finally {
       setSaving(false);
     }
+  };
+
+  // Called by TaskPanel whenever APs or tasks change
+  const handleTasksPanelChange = ({ actionPoints, tasks }) => {
+    setEditData(d => ({ ...d, actionPoints, tasks }));
   };
 
   const updateAP = (index, field, value) => {
@@ -113,11 +120,9 @@ export default function MeetingDetail() {
     setWaModal(false);
   };
 
-  // FIX: Coerce both phone values to strings before calling .trim()
   const sendWhatsApp = async () => {
     const uPhone = String(userPhone ?? '');
     const cPhone = String(coordPhone ?? '');
-
     if (!uPhone.trim() && !cPhone.trim()) {
       setWaError('Enter at least one phone number.');
       return;
@@ -134,6 +139,7 @@ export default function MeetingDetail() {
           meeting,
           userPhone: uPhone.trim() || null,
           coordinatorPhone: cPhone.trim() || null,
+          username: user?.username || null,   // ✅ fixed — now sends username
         }),
       });
       const data = await res.json();
@@ -162,7 +168,6 @@ export default function MeetingDetail() {
 
   if (!meeting) return null;
 
-  // FIX: Safe trimmed values for the disabled check on the Send button
   const uPhoneTrimmed = String(userPhone ?? '').trim();
   const cPhoneTrimmed = String(coordPhone ?? '').trim();
 
@@ -215,6 +220,7 @@ export default function MeetingDetail() {
 
         {error && <div className={styles.error}>{error}</div>}
 
+        {/* ── Overview tab ── */}
         {tab === 'overview' && (
           <div className={styles.content + ' fade-in'}>
             <div className={styles.grid}>
@@ -223,31 +229,11 @@ export default function MeetingDetail() {
                 <p className={styles.cardText}>{meeting.summary || 'No summary available.'}</p>
               </div>
 
-              <div className={'card ' + styles.card}>
-                <h2 className={styles.cardTitle}>
-                  Action Points
-                  <span className="badge badge-blue" style={{ marginLeft: 8 }}>{meeting.actionPoints?.length || 0}</span>
-                </h2>
-                {meeting.actionPoints?.length > 0 ? (
-                  <div className={styles.apList}>
-                    {meeting.actionPoints.map((ap, i) => (
-                      <div key={i} className={styles.apItem}>
-                        <div className={styles.apLeft}>
-                          <span className={styles.priorityDot} style={{ background: priorityColor(ap.priority) }} />
-                          <div>
-                            <div className={styles.apTask}>{ap.task}</div>
-                            <div className={styles.apMeta}>
-                              <span>👤 {ap.owner}</span>
-                              <span>📅 {ap.dueDate}</span>
-                            </div>
-                          </div>
-                        </div>
-                        <span className={styles['priority-' + ap.priority] + ' badge'}>{ap.priority}</span>
-                      </div>
-                    ))}
-                  </div>
-                ) : <p className={styles.empty}>No action points captured.</p>}
-              </div>
+              <TaskPanel
+                actionPoints={editData.actionPoints || meeting.actionPoints || []}
+                tasks={editData.tasks || meeting.tasks || []}
+                onTasksChange={handleTasksPanelChange}
+              />
 
               {meeting.decisions?.length > 0 && (
                 <div className={'card ' + styles.card}>
@@ -268,6 +254,7 @@ export default function MeetingDetail() {
           </div>
         )}
 
+        {/* ── Transcript tab ── */}
         {tab === 'transcript' && (
           <div className={styles.content + ' fade-in'}>
             <div className={'card ' + styles.card} style={{ maxWidth: 800 }}>
@@ -277,6 +264,7 @@ export default function MeetingDetail() {
           </div>
         )}
 
+        {/* ── Edit tab ── */}
         {tab === 'edit' && (
           <div className={styles.content + ' fade-in'}>
             <div className={styles.editGrid}>
@@ -290,31 +278,11 @@ export default function MeetingDetail() {
                 />
               </div>
 
-              <div className={'card ' + styles.card}>
-                <div className={styles.cardTitleRow}>
-                  <h2 className={styles.cardTitle}>Action Points</h2>
-                  <button className="btn btn-secondary" style={{ fontSize: 12, padding: '6px 12px' }} onClick={addAP}>+ Add</button>
-                </div>
-                <div className={styles.apList}>
-                  {editData.actionPoints?.map((ap, i) => (
-                    <div key={i} className={styles.apEditItem}>
-                      <div className={styles.apEditRow}>
-                        <input className="input" placeholder="Task description" value={ap.task} onChange={e => updateAP(i, 'task', e.target.value)} />
-                        <button className="btn btn-danger" style={{ padding: '8px 10px', flexShrink: 0 }} onClick={() => removeAP(i)}>✕</button>
-                      </div>
-                      <div className={styles.apEditMeta}>
-                        <input className="input" placeholder="Owner" value={ap.owner} onChange={e => updateAP(i, 'owner', e.target.value)} style={{ flex: 1 }} />
-                        <select className="input" value={ap.priority} onChange={e => updateAP(i, 'priority', e.target.value)} style={{ flex: 0.8 }}>
-                          <option value="high">High</option>
-                          <option value="medium">Medium</option>
-                          <option value="low">Low</option>
-                        </select>
-                        <input className="input" placeholder="Due date" value={ap.dueDate} onChange={e => updateAP(i, 'dueDate', e.target.value)} style={{ flex: 1 }} />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              <TaskPanel
+                actionPoints={editData.actionPoints || []}
+                tasks={editData.tasks || []}
+                onTasksChange={handleTasksPanelChange}
+              />
 
               <div className={'card ' + styles.card}>
                 <h2 className={styles.cardTitle}>Decisions</h2>
@@ -355,9 +323,10 @@ export default function MeetingDetail() {
             </div>
           </div>
         )}
+
       </main>
 
-      {/* ── WhatsApp Modal ─────────────────────────────────── */}
+      {/* ── WhatsApp Modal ── */}
       {waModal && (
         <div
           onClick={e => { if (e.target === e.currentTarget) closeWaModal(); }}
@@ -373,8 +342,6 @@ export default function MeetingDetail() {
             width: '100%', maxWidth: 460,
             boxShadow: '0 20px 60px rgba(0,0,0,0.18)',
           }}>
-
-            {/* Title row */}
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 24 }}>
               <div>
                 <h2 style={{ fontSize: 20, fontWeight: 700, color: 'var(--gray-900)', margin: 0 }}>
@@ -390,7 +357,6 @@ export default function MeetingDetail() {
               </button>
             </div>
 
-            {/* Success */}
             {waStatus === 'success' && (
               <div style={{ background: '#D1FAE5', color: '#065F46', borderRadius: 10, padding: '16px 18px', fontSize: 14, lineHeight: 1.6, marginBottom: 20 }}>
                 <div style={{ fontWeight: 600, marginBottom: 6 }}>✅ Messages sent successfully!</div>
@@ -399,7 +365,6 @@ export default function MeetingDetail() {
               </div>
             )}
 
-            {/* Partial */}
             {waStatus === 'partial' && (
               <div style={{ background: '#FEF3C7', color: '#92400E', borderRadius: 10, padding: '16px 18px', fontSize: 14, lineHeight: 1.6, marginBottom: 16 }}>
                 <div style={{ fontWeight: 600, marginBottom: 6 }}>⚠️ Partially sent</div>
@@ -409,7 +374,6 @@ export default function MeetingDetail() {
               </div>
             )}
 
-            {/* Error */}
             {waStatus === 'error' && (
               <div style={{ background: '#FEE2E2', color: '#B91C1C', borderRadius: 10, padding: '14px 16px', fontSize: 13, marginBottom: 16 }}>
                 <div style={{ fontWeight: 600, marginBottom: 4 }}>❌ Failed to send</div>
@@ -417,10 +381,8 @@ export default function MeetingDetail() {
               </div>
             )}
 
-            {/* Form — hidden after full success */}
             {waStatus !== 'success' && (
               <>
-                {/* Meeting pill */}
                 <div style={{
                   background: 'var(--off-white)', border: '1px solid var(--gray-200)',
                   borderRadius: 8, padding: '10px 14px', marginBottom: 20,
@@ -428,41 +390,28 @@ export default function MeetingDetail() {
                 }}>
                   <span style={{ fontWeight: 600, color: 'var(--gray-800)' }}>{meeting.title || 'Untitled Meeting'}</span>
                   <span style={{ marginLeft: 8, color: 'var(--gray-400)' }}>
-                    · {meeting.actionPoints?.length || 0} action points · {meeting.decisions?.length || 0} decisions
+                    · {meeting.actionPoints?.length || 0} action points · {meeting.tasks?.length || 0} tasks · {meeting.decisions?.length || 0} decisions
                   </span>
                 </div>
 
-                {/* Your number */}
                 <div style={{ marginBottom: 16 }}>
                   <label style={{ display: 'block', fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--gray-500)', marginBottom: 6 }}>
                     Your WhatsApp Number
                   </label>
-                  <input
-                    className="input" type="tel"
-                    placeholder="e.g. +91 98765 43210"
-                    value={userPhone}
-                    onChange={e => setUserPhone(e.target.value)}
-                    disabled={waSending}
-                  />
+                  <input className="input" type="tel" placeholder="e.g. +91 98765 43210"
+                    value={userPhone} onChange={e => setUserPhone(e.target.value)} disabled={waSending} />
                   <p style={{ fontSize: 11, color: 'var(--gray-400)', marginTop: 4 }}>Include country code · e.g. +91 for India</p>
                 </div>
 
-                {/* Coordinator number */}
                 <div style={{ marginBottom: 24 }}>
                   <label style={{ display: 'block', fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--gray-500)', marginBottom: 6 }}>
                     Process Coordinator's Number{' '}
                     <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(optional)</span>
                   </label>
-                  <input
-                    className="input" type="tel"
-                    placeholder="e.g. +91 9987921288"
-                    value={coordPhone}
-                    onChange={e => setCoordPhone(e.target.value)}
-                    disabled={waSending}
-                  />
+                  <input className="input" type="tel" placeholder="e.g. +91 9987921288"
+                    value={coordPhone} onChange={e => setCoordPhone(e.target.value)} disabled={waSending} />
                 </div>
 
-                {/* Buttons */}
                 <div style={{ display: 'flex', gap: 10 }}>
                   <button className="btn btn-ghost" onClick={closeWaModal} disabled={waSending} style={{ flex: 1 }}>
                     Cancel
@@ -470,7 +419,6 @@ export default function MeetingDetail() {
                   <button
                     className="btn btn-primary"
                     onClick={sendWhatsApp}
-                    // FIX: Use pre-computed safe trimmed values for the disabled check
                     disabled={waSending || (!uPhoneTrimmed && !cPhoneTrimmed)}
                     style={{ flex: 2, justifyContent: 'center', gap: 8 }}
                   >

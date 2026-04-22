@@ -71,7 +71,7 @@ export default function NewMeeting() {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-      await saveMeeting(user.email, meeting);
+      await saveMeeting(user.username, meeting);  // ✅ pass username
       router.push(`/meeting/${meeting.id}`);
     } catch (err) {
       setError('Save failed: ' + err.message);
@@ -91,18 +91,18 @@ export default function NewMeeting() {
     setUploadProgress(0);
 
     try {
-      // 1. Decode and chunk the audio
+      // 1. Decode and chunk the audio client-side
       const audioBuffer = await decodeAudioFile(file);
       setDuration(audioBuffer.duration);
 
-      const chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 30); // 30s chunks
+      const chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 30);
       const totalChunks = chunks.length;
       const results = [];
 
       for (let i = 0; i < chunks.length; i++) {
-        setUploadProgress(Math.round(((i) / totalChunks) * 100));
+        setUploadProgress(Math.round((i / totalChunks) * 100));
 
-        // 2. Upload chunk and start job
+        // 2. POST raw audio to transcribe-chunk — it uploads, polls, and returns the full result
         const uploadRes = await fetch('/api/transcribe-chunk', {
           method: 'POST',
           headers: { 'Content-Type': 'application/octet-stream' },
@@ -110,46 +110,38 @@ export default function NewMeeting() {
         });
 
         if (!uploadRes.ok) {
-          const errText = await uploadRes.text();
-          throw new Error(errText || `Upload error ${uploadRes.status}`);
+          const errData = await uploadRes.json().catch(() => ({}));
+          throw new Error(errData.error || `Transcription error ${uploadRes.status}`);
         }
 
-        const uploadData = await uploadRes.json();
-        const transcriptId = uploadData.id;
+        const chunkResult = await uploadRes.json();
 
-        // 3. Poll for status
-        let completed = false;
-        let chunkResult = null;
-        while (!completed) {
-          await sleep(3000);
-          const statusRes = await fetch(`/api/transcript-status?id=${transcriptId}`);
-          if (!statusRes.ok) {
-            const errText = await statusRes.text();
-            throw new Error(errText || `Poll error ${statusRes.status}`);
-          }
-          chunkResult = await statusRes.json();
-
-          if (chunkResult.status === 'completed') {
-            completed = true;
-          } else if (chunkResult.status === 'error') {
-            throw new Error(chunkResult.error || 'Transcription error');
-          }
+        if (chunkResult.error) {
+          throw new Error(chunkResult.error);
         }
 
-        // 4. Attach the correct offset to the result
-        chunkResult.offsetMs = chunks[i].startMs;
-        results.push(chunkResult);
+        // 3. Attach the correct time offset and collect result
+        results.push({
+          ...chunkResult,
+          offsetMs: chunks[i].startMs,
+          transcript: chunkResult.text || '',
+        });
 
         setUploadProgress(Math.round(((i + 1) / totalChunks) * 100));
       }
 
-      // 5. Combine results
-      const combinedTranscript = results.map(r => r.transcript).join(' ').trim();
+      // 4. Combine all chunk results
+      const combinedTranscript = results
+        .map(r => (r.transcript || '').trim())
+        .filter(Boolean)
+        .join('\n\n');
+
       const combinedSrt = buildSrtFromResults(results);
 
       setTranscript(combinedTranscript);
       setSrt(combinedSrt);
       setUploadState('done');
+
     } catch (err) {
       console.error(err);
       setError('Upload transcription failed: ' + err.message);
