@@ -92,6 +92,14 @@ function decryptPassword(enc) {
   }
 }
 
+function normalizeEmail(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function normalizePhone(phone) {
+  return String(phone || '').replace(/\D/g, '');
+}
+
 function getOrCreateSheet(ss, name) {
   let sheet = ss.getSheetByName(name);
   if (!sheet) sheet = ss.insertSheet(name);
@@ -191,11 +199,12 @@ function ensureAuthSheet(ss) {
 function findUserRow(authSheet, identifier) {
   const data = authSheet.getDataRange().getValues();
   const id = String(identifier).toLowerCase().trim();
+  const phoneId = normalizePhone(identifier);
   for (let i = 1; i < data.length; i++) {
-    const email = String(data[i][A_EMAIL]).toLowerCase().trim();
-    const phone = String(data[i][A_PHONE]).replace(/\s+/g, '');
+    const email = normalizeEmail(data[i][A_EMAIL]);
+    const phone = normalizePhone(data[i][A_PHONE]);
     const uname = String(data[i][A_USERNAME]).toLowerCase().trim();
-    if (email === id || phone === id || uname === id) {
+    if (email === id || (phoneId && phone === phoneId) || uname === id) {
       return { row: i + 1, data: data[i] };
     }
   }
@@ -351,32 +360,35 @@ function doGet(e) {
 // ============================================================
 
 function handleRegister(body, t0) {
-  const { email, phone, username, password } = body;
+  const email = normalizeEmail(body.email);
+  const phone = normalizePhone(body.phone);
+  const username = String(body.username || '').trim();
+  const password = body.password;
 
   if (!username || !password) {
     log('WARN', 'register', username || '?', 'AUTH', 'Missing required fields');
     return fail('username and password are required');
   }
-  if (!email && !phone) {
-    log('WARN', 'register', username, 'AUTH', 'Must provide email or phone');
-    return fail('Provide at least an email or phone number');
+  if (!email || !phone) {
+    log('WARN', 'register', username, 'AUTH', 'Missing email or phone');
+    return fail('Email address and phone number are required');
   }
 
   const ss = getSpreadsheet();
   const authSheet = ensureAuthSheet(ss);
 
-  if (email && findUserRow(authSheet, email)) {
+  if (findUserRow(authSheet, email)) {
     log('WARN', 'register', username, 'AUTH', 'Duplicate email', email);
     return fail('An account with this email already exists');
   }
-  if (phone && findUserRow(authSheet, phone)) {
+  if (findUserRow(authSheet, phone)) {
     log('WARN', 'register', username, 'AUTH', 'Duplicate phone', phone);
     return fail('An account with this phone number already exists');
   }
 
   authSheet.appendRow([
-    email    || '',
-    phone    || '',
+    email,
+    phone,
     username,
     hashPassword(password),
     true,
@@ -385,10 +397,8 @@ function handleRegister(body, t0) {
     password, // ⚠️ TEST MODE — revert to encryptPassword(password) for prod
   ]);
 
-  if (email) {
-    getSheetForEmail(ss, email, true);
-    log('INFO', 'register', username, 'AUTH', 'User sheet tab created', { tab: tabNameFromEmail(email) });
-  }
+  getSheetForEmail(ss, email, true);
+  log('INFO', 'register', username, 'AUTH', 'User sheet tab created', { tab: tabNameFromEmail(email) });
 
   log('INFO', 'register', username, 'AUTH', 'User registered', { email, phone }, Date.now() - t0);
   return ok({ username });

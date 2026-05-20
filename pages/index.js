@@ -6,7 +6,7 @@ import styles from '../styles/Auth.module.css';
 
 export default function AuthPage() {
   const [mode, setMode] = useState('login'); // 'login' | 'register'
-  const [form, setForm] = useState({ identifier: '', username: '', phone: '', password: '' });
+  const [form, setForm] = useState({ identifier: '', email: '', phone: '', username: '', password: '' });
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const { signIn } = useAuth();
@@ -29,22 +29,22 @@ export default function AuthPage() {
           username: data.user.username,
         });
       } else {
-        // register — email or phone required, both optional but at least one
-        if (!form.identifier) {
-          setError('Enter an email or phone number');
+        const email = form.email.trim().toLowerCase();
+        const phone = form.phone.replace(/\D/g, '');
+        if (!email || !phone) {
+          setError('Enter both email address and phone number');
           setLoading(false);
           return;
         }
-        const isEmail = form.identifier.includes('@');
         data = await register({
-          email: isEmail ? form.identifier : '',
-          phone: isEmail ? '' : form.identifier,
-          username: form.username,
+          email,
+          phone,
+          username: form.username.trim(),
           password: form.password,
         });
         signIn({
-          email: isEmail ? form.identifier : '',
-          phone: isEmail ? '' : form.identifier,
+          email,
+          phone,
           username: data.username,
         });
       }
@@ -97,20 +97,48 @@ export default function AuthPage() {
           </div>
 
           <form onSubmit={submit} className={styles.form}>
-            <div className={styles.field}>
-              <label className={styles.label}>
-                {mode === 'login' ? 'Email or Phone Number' : 'Email or Phone Number'}
-              </label>
-              <input
-                className="input"
-                name="identifier"
-                type="text"
-                required
-                value={form.identifier}
-                onChange={handle}
-                placeholder={mode === 'login' ? 'email or phone number' : 'you@company.com or +91...'}
-              />
-            </div>
+            {mode === 'login' ? (
+              <div className={styles.field}>
+                <label className={styles.label}>Email or Phone Number</label>
+                <input
+                  className="input"
+                  name="identifier"
+                  type="text"
+                  required
+                  value={form.identifier}
+                  onChange={handle}
+                  placeholder="email or phone number"
+                />
+              </div>
+            ) : (
+              <>
+                <div className={styles.field}>
+                  <label className={styles.label}>Email Address</label>
+                  <input
+                    className="input"
+                    name="email"
+                    type="email"
+                    required
+                    value={form.email}
+                    onChange={handle}
+                    placeholder="you@company.com"
+                  />
+                </div>
+
+                <div className={styles.field}>
+                  <label className={styles.label}>Phone Number</label>
+                  <input
+                    className="input"
+                    name="phone"
+                    type="tel"
+                    required
+                    value={form.phone}
+                    onChange={handle}
+                    placeholder="+91 98765 43210"
+                  />
+                </div>
+              </>
+            )}
 
             {mode === 'register' && (
               <div className={styles.field}>
