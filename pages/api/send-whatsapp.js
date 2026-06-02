@@ -186,7 +186,7 @@ export default async function handler(req, res) {
         return res.status(405).end();
     }
 
-    const { meeting, userPhone, username } = req.body || {};
+    const { meeting, userPhone, coordinatorPhone, username } = req.body || {};
 
     if (!meeting) {
         return res.status(400).json({
@@ -196,34 +196,40 @@ export default async function handler(req, res) {
     }
 
     const userChatId = toChatId(userPhone);
-    const coordChatId = toChatId(COORDINATOR_PHONE);
+    const coordChatId = toChatId(coordinatorPhone || COORDINATOR_PHONE);
 
-    if (!userChatId) {
+    if (!userChatId && !coordChatId) {
         return res.status(400).json({
             success: false,
-            error: 'No valid phone number provided',
+            error: 'No valid WhatsApp phone number provided',
         });
     }
 
     const results = { user: null, coordinator: null };
     const errors = [];
 
-    // Send to user
-    try {
-        await sendMessage(userChatId, buildUserMessage(meeting, username));
-        results.user = 'sent';
-    } catch (err) {
-        results.user = 'failed';
-        errors.push(`User (${userPhone}): ${err.message}`);
+    if (userChatId) {
+        try {
+            await sendMessage(userChatId, buildUserMessage(meeting, username));
+            results.user = 'sent';
+        } catch (err) {
+            results.user = 'failed';
+            errors.push(`User (${userPhone}): ${err.message}`);
+        }
+    } else {
+        results.user = 'skipped';
     }
 
-    // Send to coordinator (FIXED)
-    try {
-        await sendMessage(coordChatId, buildCoordinatorMessage(meeting, username));
-        results.coordinator = 'sent';
-    } catch (err) {
-        results.coordinator = 'failed';
-        errors.push(`Coordinator: ${err.message}`);
+    if (coordChatId) {
+        try {
+            await sendMessage(coordChatId, buildCoordinatorMessage(meeting, username));
+            results.coordinator = 'sent';
+        } catch (err) {
+            results.coordinator = 'failed';
+            errors.push(`Coordinator (${coordinatorPhone || COORDINATOR_PHONE}): ${err.message}`);
+        }
+    } else {
+        results.coordinator = 'skipped';
     }
 
     if (results.user !== 'sent' && results.coordinator !== 'sent') {

@@ -79,6 +79,9 @@ export default async function handler(req, res) {
   if (!transcript?.trim()) return res.status(400).json({ error: 'No transcript' });
 
   const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ success: false, error: 'OPENROUTER_API_KEY not set' });
+  }
 
   // ── Chunk the transcript ──────────────────────────────────
   // Split on sentence boundaries every ~3000 chars so nothing is dropped
@@ -134,6 +137,9 @@ Return ONLY the JSON array. No explanation, no markdown.`;
             max_tokens: 2000,
           }),
         });
+        if (!resp.ok) {
+          throw new Error(`OpenRouter chunk request failed (${resp.status}): ${await resp.text()}`);
+        }
         const data = await resp.json();
         const text = data.choices?.[0]?.message?.content || '[]';
         try {
@@ -144,7 +150,7 @@ Return ONLY the JSON array. No explanation, no markdown.`;
       allActionPoints.push(...results.flat());
     }
   } catch (err) {
-    return res.status(500).json({ error: 'Chunk extraction failed: ' + err.message });
+    return res.status(500).json({ success: false, error: 'Chunk extraction failed: ' + err.message });
   }
 
   // ── Dedup action points ───────────────────────────────────
@@ -231,6 +237,13 @@ ${summaryContext}`;
       }),
     ]);
 
+    if (!summaryResp.ok) {
+      throw new Error(`OpenRouter summary request failed (${summaryResp.status}): ${await summaryResp.text()}`);
+    }
+    if (!tasksResp.ok) {
+      throw new Error(`OpenRouter tasks request failed (${tasksResp.status}): ${await tasksResp.text()}`);
+    }
+
     // Parse summary
     try {
       const summaryData = await summaryResp.json();
@@ -262,7 +275,7 @@ ${summaryContext}`;
       tasks = [];
     }
   } catch (err) {
-    summary = 'Analysis failed: ' + err.message;
+    return res.status(500).json({ success: false, error: 'Analysis failed: ' + err.message });
   }
 
   return res.json({

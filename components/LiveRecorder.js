@@ -121,7 +121,23 @@ async function transcribeUploadUrl(upload_url) {
   });
   const data = await res.json();
   if (!res.ok || data.error) throw new Error(data.error || `Transcribe error ${res.status}`);
-  return data;
+  if (!data.id) throw new Error('Transcription job was not created');
+
+  for (let attempt = 0; attempt < 80; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    const pollRes = await fetch(`/api/transcript-status?id=${encodeURIComponent(data.id)}`);
+    const pollData = await pollRes.json().catch(() => ({}));
+
+    if (!pollRes.ok) {
+      throw new Error(pollData.error || `Transcription status error ${pollRes.status}`);
+    }
+    if (pollData.status === 'completed') return pollData;
+    if (pollData.status === 'error') {
+      throw new Error(pollData.error || 'Transcription failed');
+    }
+  }
+
+  throw new Error('Transcription timed out while waiting for AssemblyAI');
 }
 
 async function transcribeSegment(blob, segmentIndex, offsetMs, onProgress) {

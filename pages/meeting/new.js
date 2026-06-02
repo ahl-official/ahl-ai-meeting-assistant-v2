@@ -64,6 +64,7 @@ export default function NewMeeting() {
         srt,
         summary: aiResult?.summary || '',
         actionPoints: aiResult?.actionPoints || [],
+        tasks: aiResult?.tasks || [],
         decisions: aiResult?.decisions || [],
         nextSteps: aiResult?.nextSteps || '',
         duration: Math.round(duration / 60),
@@ -78,6 +79,43 @@ export default function NewMeeting() {
     } finally {
       setSaving(false);
     }
+  };
+
+  const pollTranscript = async (id) => {
+    for (let attempt = 0; attempt < 80; attempt++) {
+      await sleep(3000);
+      const pollRes = await fetch(`/api/transcript-status?id=${encodeURIComponent(id)}`);
+      const pollData = await pollRes.json().catch(() => ({}));
+
+      if (!pollRes.ok) {
+        throw new Error(pollData.error || `Transcription status error ${pollRes.status}`);
+      }
+      if (pollData.status === 'completed') return pollData;
+      if (pollData.status === 'error') {
+        throw new Error(pollData.error || 'Transcription failed');
+      }
+    }
+
+    throw new Error('Transcription timed out while waiting for AssemblyAI');
+  };
+
+  const transcribeAudioChunk = async (blob) => {
+    const uploadRes = await fetch('/api/transcribe-chunk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: blob,
+    });
+
+    const uploadData = await uploadRes.json().catch(() => ({}));
+
+    if (!uploadRes.ok || uploadData.error) {
+      throw new Error(uploadData.error || `Transcription error ${uploadRes.status}`);
+    }
+    if (!uploadData.id) {
+      throw new Error('Transcription job was not created');
+    }
+
+    return pollTranscript(uploadData.id);
   };
 
   const handleFileUpload = async (e) => {
@@ -102,35 +140,20 @@ export default function NewMeeting() {
       for (let i = 0; i < chunks.length; i++) {
         setUploadProgress(Math.round((i / totalChunks) * 100));
 
-        // 2. POST raw audio to transcribe-chunk — it uploads, polls, and returns the full result
-        const uploadRes = await fetch('/api/transcribe-chunk', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body: chunks[i].blob,
-        });
+        // 2. Queue transcription, then poll status from the browser.
+        const chunkResult = await transcribeAudioChunk(chunks[i].blob);
 
-        if (!uploadRes.ok) {
-          const errData = await uploadRes.json().catch(() => ({}));
-          throw new Error(errData.error || `Transcription error ${uploadRes.status}`);
-        }
-
-        const chunkResult = await uploadRes.json();
-
-        if (chunkResult.error) {
-          throw new Error(chunkResult.error);
-        }
-
-        // 3. Attach the correct time offset and collect result
+        // 3. Attach the correct time offset and collect result.
         results.push({
           ...chunkResult,
           offsetMs: chunks[i].startMs,
-          transcript: chunkResult.text || '',
+          transcript: chunkResult.text || chunkResult.transcript || '',
         });
 
         setUploadProgress(Math.round(((i + 1) / totalChunks) * 100));
       }
 
-      // 4. Combine all chunk results
+      // 4. Combine all chunk results.
       const combinedTranscript = results
         .map(r => (r.transcript || '').trim())
         .filter(Boolean)

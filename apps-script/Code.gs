@@ -385,6 +385,10 @@ function handleRegister(body, t0) {
     log('WARN', 'register', username, 'AUTH', 'Duplicate phone', phone);
     return fail('An account with this phone number already exists');
   }
+  if (findUserByUsername(authSheet, username)) {
+    log('WARN', 'register', username, 'AUTH', 'Duplicate username', username);
+    return fail('An account with this username already exists');
+  }
 
   authSheet.appendRow([
     email,
