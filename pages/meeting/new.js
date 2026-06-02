@@ -102,7 +102,7 @@ export default function NewMeeting() {
   const transcribeAudioChunk = async (blob) => {
     const uploadRes = await fetch('/api/transcribe-chunk', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
+      headers: { 'Content-Type': blob.type || 'application/octet-stream' },
       body: blob,
     });
 
@@ -129,11 +129,17 @@ export default function NewMeeting() {
     setUploadProgress(0);
 
     try {
-      // 1. Decode and chunk the audio client-side
-      const audioBuffer = await decodeAudioFile(file);
-      setDuration(audioBuffer.duration);
+      let chunks;
+      try {
+        const audioBuffer = await decodeAudioFile(file);
+        setDuration(audioBuffer.duration);
+        chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 30);
+      } catch (decodeErr) {
+        console.warn('Browser audio decode failed; uploading original file instead.', decodeErr);
+        setDuration(0);
+        chunks = [{ blob: file, startMs: 0, durationMs: 0 }];
+      }
 
-      const chunks = await splitAudioBufferIntoWavChunks(audioBuffer, 30);
       const totalChunks = chunks.length;
       const results = [];
 
