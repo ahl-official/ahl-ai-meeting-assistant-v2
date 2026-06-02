@@ -10,17 +10,50 @@ const WAHA_BASE_URL = (process.env.WAHA_BASE_URL === 'https://waha.amankhan.spac
 const WAHA_API_KEY = process.env.WAHA_API_KEY;
 const WAHA_SESSION = process.env.WAHA_SESSION;
 
-// Hardcoded coordinator number
-const COORDINATOR_PHONE = '919987921288';
-
 // ── Helpers ──────────────────────────────────────────────────
 
-function toChatId(raw) {
+function normalizePhone(raw) {
     if (!raw) return null;
-    let digits = String(raw).replace(/\D/g, '');
+    const digits = String(raw).replace(/\D/g, '');
+    return digits || null;
+}
+
+function toChatId(raw) {
+    let digits = normalizePhone(raw);
+    if (!digits) return null;
     if (digits.length === 10) digits = '91' + digits;
     if (digits.length < 7) return null;
     return digits + '@c.us';
+}
+
+async function resolveChatId(raw) {
+    const fallbackChatId = toChatId(raw);
+    if (!fallbackChatId) return null;
+
+    const phone = fallbackChatId.replace('@c.us', '');
+    const url = new URL(`${WAHA_BASE_URL}/api/contacts/check-exists`);
+    url.searchParams.set('phone', phone);
+    url.searchParams.set('session', WAHA_SESSION);
+
+    const response = await fetch(url.toString(), {
+        method: 'GET',
+        headers: {
+            'Accept': 'application/json',
+            'X-Api-Key': WAHA_API_KEY,
+        },
+    });
+
+    const body = await response.text();
+    if (!response.ok) {
+        throw new Error(`WAHA number check failed (${response.status}): ${body}`);
+    }
+
+    const data = body ? JSON.parse(body) : {};
+    if (data.numberExists === false) {
+        throw new Error(`Number ${phone} is not registered on WhatsApp`);
+    }
+
+    return data.chatId || fallbackChatId;
 }
 // ── USER MESSAGE (FULL) ───────────────────────────────────────
 
@@ -198,18 +231,31 @@ export default async function handler(req, res) {
         });
     }
 
-    const userChatId = toChatId(userPhone);
-    const coordChatId = toChatId(coordinatorPhone || COORDINATOR_PHONE);
+    let userChatId = null;
+    let coordChatId = null;
+    const resolveErrors = [];
+
+    try {
+        userChatId = await resolveChatId(userPhone);
+    } catch (err) {
+        resolveErrors.push(`User (${userPhone}): ${err.message}`);
+    }
+
+    try {
+        coordChatId = await resolveChatId(coordinatorPhone);
+    } catch (err) {
+        resolveErrors.push(`Coordinator (${coordinatorPhone}): ${err.message}`);
+    }
 
     if (!userChatId && !coordChatId) {
         return res.status(400).json({
             success: false,
-            error: 'No valid WhatsApp phone number provided',
+            error: resolveErrors.join(' | ') || 'No valid WhatsApp phone number provided',
         });
     }
 
     const results = { user: null, coordinator: null };
-    const errors = [];
+    const errors = [...resolveErrors];
 
     if (userChatId) {
         try {
@@ -229,7 +275,7 @@ export default async function handler(req, res) {
             results.coordinator = 'sent';
         } catch (err) {
             results.coordinator = 'failed';
-            errors.push(`Coordinator (${coordinatorPhone || COORDINATOR_PHONE}): ${err.message}`);
+            errors.push(`Coordinator (${coordinatorPhone}): ${err.message}`);
         }
     } else {
         results.coordinator = 'skipped';

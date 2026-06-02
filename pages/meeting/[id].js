@@ -180,7 +180,10 @@ export default function MeetingDetail() {
         }),
       });
       const data = await res.json();
-      if (!data.success && !data.results) throw new Error(data.error || 'Send failed');
+      if (!res.ok || !data.success) {
+        setWaResults(data.results || null);
+        throw new Error(data.error || 'Send failed');
+      }
       setWaResults(data.results);
       setWaStatus(data.errors?.length > 0 ? 'partial' : 'success');
       if (data.errors?.length > 0) setWaError(data.errors.join('\n'));
