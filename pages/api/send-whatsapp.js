@@ -3,7 +3,10 @@
 // Sends meeting action plan via WAHA (WhatsApp HTTP API)
 // ============================================================
 
-const WAHA_BASE_URL = process.env.WAHA_BASE_URL;
+const WAHA_BASE_URL = (process.env.WAHA_BASE_URL === 'https://waha.amankhan.space'
+    ? 'https://waha.hairscalptradingco.com'
+    : process.env.WAHA_BASE_URL || 'https://waha.hairscalptradingco.com'
+).replace(/\/$/, '');
 const WAHA_API_KEY = process.env.WAHA_API_KEY;
 const WAHA_SESSION = process.env.WAHA_SESSION;
 
